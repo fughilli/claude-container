@@ -197,8 +197,9 @@ forwarding and named services (see the next section for the latter):
 
 Each `ports` entry is passed straight to `docker run -p`, so any value Docker
 accepts works (`host:container`, `ip:host:container`, a bare container port, or
-a `/udp` suffix). `overlay.json` and `skills/` are excluded from the image hash,
-so changing ports, services, or skills never triggers a rebuild.
+a `/udp` suffix). `overlay.json`, `startup.sh` and `skills/` are excluded from
+the image hash, so changing ports, services, the startup hook, or skills never
+triggers a rebuild.
 
 #### Runtime flags
 

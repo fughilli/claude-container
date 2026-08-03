@@ -211,8 +211,8 @@ WORKSPACE OVERLAY:
                             (deployed at launch, never baked into the image).
 
     The built image is tagged claude-container-overlay:<hash> over the base
-    image plus the build inputs; overlay.json and skills/ are excluded from the
-    hash, so port/skill changes never trigger a rebuild.
+    image plus the build inputs; overlay.json, startup.sh and skills/ are
+    excluded from the hash, so changes to them never trigger a rebuild.
 
     RUNTIME FLAGS are an allowlist, not a passthrough — there is deliberately
     no way to express -v, --privileged, --pid=host or --network=host, because
@@ -1426,8 +1426,9 @@ suggest_adoptable_skills
 #
 # The overlay image is tagged with a content hash of (base image + build inputs)
 # so switching branches that have different overlays just switches images.
-# Runtime-only inputs (overlay.json, skills/) are excluded from the hash, so
-# changing ports or skills never triggers a rebuild.
+# Runtime-only inputs (overlay.json, startup.sh, skills/) are excluded from the
+# hash, so changing ports, runtime flags, the startup hook or skills never
+# triggers a rebuild.
 # Translate the allowlisted runtime keys of an overlay.json into docker run
 # arguments, one per line. Kept in a function because the parser is a heredoc:
 # bash 3.2 (macOS's system bash) looks for the closing paren of a process
@@ -1690,7 +1691,7 @@ if [ -n "$OVERLAY_BUILD" ]; then
         OVERLAY_HASH=$({
             printf '%s\n' "$IMAGE" "$BASE_IMAGE_KEY"
             printf '%s' "$OVERLAY_BUILD"
-            (cd "$OVERLAY_CONTEXT" && find . -type f ! -name Dockerfile ! -name overlay.json ! -path './skills/*' | LC_ALL=C sort | while IFS= read -r ctx_file; do
+            (cd "$OVERLAY_CONTEXT" && find . -type f ! -name Dockerfile ! -name overlay.json ! -name startup.sh ! -path './skills/*' | LC_ALL=C sort | while IFS= read -r ctx_file; do
                 printf '%s\n' "$ctx_file"
                 cat "$ctx_file"
             done)

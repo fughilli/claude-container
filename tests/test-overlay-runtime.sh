@@ -149,6 +149,39 @@ out="$(run_launcher "$WS")"
 assert_contains "an overlay without runtime keys still launches" "$out" "DOCKER-RUN:"
 assert_not_contains "and adds no runtime flags" "$out" "Overlay runtime flags"
 
+# --- image hash ---------------------------------------------------------------
+
+echo "== startup.sh is a runtime input, not a build input =="
+
+WS="$(new_workspace ws-hash)"
+echo "RUN true" > "$WS/.claude-container-overlay/Dockerfile"
+echo "echo one" > "$WS/.claude-container-overlay/startup.sh"
+echo "conf" > "$WS/.claude-container-overlay/extra.conf"
+
+overlay_tag() { printf '%s\n' "$1" | sed -n 's/.*\(claude-container-overlay:[0-9a-f]*\).*/\1/p' | head -1; }
+
+before="$(overlay_tag "$(run_launcher "$WS")")"
+echo "echo two — a different hook" > "$WS/.claude-container-overlay/startup.sh"
+after="$(overlay_tag "$(run_launcher "$WS")")"
+echo "conf changed" > "$WS/.claude-container-overlay/extra.conf"
+after_ctx="$(overlay_tag "$(run_launcher "$WS")")"
+
+if [ -n "$before" ]; then
+    pass "overlay image is tagged with a hash"
+else
+    fail "overlay image is tagged with a hash"
+fi
+if [ "$before" = "$after" ]; then
+    pass "editing startup.sh does not trigger a rebuild"
+else
+    fail "editing startup.sh does not trigger a rebuild (got: '$after', want: '$before')"
+fi
+if [ "$after_ctx" != "$after" ]; then
+    pass "editing a build-context file still does"
+else
+    fail "editing a build-context file still does (hash unchanged: '$after_ctx')"
+fi
+
 # --- startup hook -------------------------------------------------------------
 
 echo "== overlay startup hook =="

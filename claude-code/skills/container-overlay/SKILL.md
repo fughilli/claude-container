@@ -60,7 +60,7 @@ For a fixed host port, declare mappings in `overlay.json`:
 }
 ```
 
-Each entry is passed straight to `docker run -p`, so any value docker accepts works: `host:container`, `ip:host:container`, a bare container port, or a `/udp` suffix. Fixed mappings take effect at the **next launch** and collide if another running container claims the same host port. `overlay.json` is excluded from the image hash, so **changing ports or services never triggers a rebuild** — ports only change the `-p` flags on the next `docker run`; services apply live.
+Each entry is passed straight to `docker run -p`, so any value docker accepts works: `host:container`, `ip:host:container`, a bare container port, or a `/udp` suffix. Fixed mappings take effect at the **next launch** and collide if another running container claims the same host port. `overlay.json` (like `startup.sh`) is excluded from the image hash, so **changing ports or services never triggers a rebuild** — ports only change the `-p` flags on the next `docker run`; services apply live.
 
 ## Runtime flags
 
@@ -200,7 +200,7 @@ COPY pip.conf /etc/pip.conf
 When `claude-container` starts in a workspace containing `.claude-container-overlay/`:
 
 1. Reads port mappings and runtime flags from `overlay.json` (runtime-only; never affects the image).
-2. Hashes the base image tag + `Dockerfile` + any other files in the directory (excluding `overlay.json` and `skills/`).
+2. Hashes the base image tag + `Dockerfile` + any other files in the directory (excluding `overlay.json`, `startup.sh` and `skills/`).
 3. Looks for a local image tagged `claude-container-overlay:<hash>`.
 4. If it exists, uses it. If not, builds it: `FROM <base-image>` followed by the fragment, with the overlay directory as build context.
 5. Runs the container as usual against that image, adding the `-p` flags, the validated runtime flags, plus a single ephemeral publish of the service mux (which backs named services).
