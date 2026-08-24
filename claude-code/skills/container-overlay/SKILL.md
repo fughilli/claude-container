@@ -24,7 +24,7 @@ All four parts are optional; create only what you need. The directory can be com
 - **`Dockerfile`** — a fragment concatenated after `FROM <base-image>` during `docker build`. It executes **as root** at build time (the entrypoint switches users at runtime). The overlay directory is the **build context**, so `COPY someconf /etc/someconf` works for files you place next to the Dockerfile.
 - **`overlay.json`** — runtime configuration the launcher reads: a `ports` array of mappings passed straight to `docker run -p`, a `services` object naming in-container ports (see Named services below), and the `capabilities`/`devices`/`sysctls`/`env` runtime flags (see Runtime flags below).
 - **`startup.sh`** — a hook run once per container start, for setup that can't be baked into an image layer (see Startup hook below).
-- **`skills/`** — skill proposals; deployed at launch, never baked into the image. Covered by the `container-skills` skill, not this one.
+- **`skills/`** — skill proposals; deployed at launch. Their prose is never a build input, but a skill may ship an `overlay.Dockerfile` that *is* — see **Skill image fragments** below. Covered by the `container-skills` skill, not this one.
 
 A legacy form — `.claude-container-overlay` as a single Dockerfile-fragment *file* with `# claude-container:port <mapping>` comments — still works. If you find one, migrate it: `mkdir` the directory, move the fragment to `Dockerfile` (dropping the port comments), and convert the port comments into `overlay.json`.
 
@@ -215,3 +215,26 @@ Because the tag is content-addressed, switching branches that have different ove
 - `WORKDIR` other than `/workspace` — `/workspace` is the bind mount point.
 - `COPY` of workspace files outside the overlay directory — the build context is `.claude-container-overlay/` only, and the workspace is mounted at *run* time. If you need a file in the image, copy it into the overlay directory first, but prefer not to — bind mounts are simpler.
 - `COPY` of `skills/` or `overlay.json` into the image — they're excluded from the rebuild hash, so the image would silently go stale when they change.
+
+## Skill image fragments
+
+A skill can ship an `overlay.Dockerfile` next to its `SKILL.md`. The launcher concatenates the fragments of every active skill **ahead of** this workspace's own `Dockerfile`, so a skill can install a foundation (a toolchain, a runtime, Nix) that the project's overlay then builds on.
+
+This matters when you are writing a skill about installing something. Prose alone cannot install it — a future session still has to perform the steps by hand, and usually won't. Put the install in the fragment; keep the *usage* in the SKILL.md.
+
+```
+.claude-container-overlay/skills/my-skill/
+├── SKILL.md            # how to use the thing
+└── overlay.Dockerfile  # how it gets into the image (runs as root at build time)
+```
+
+Rules worth knowing before you write one:
+
+- **No `COPY`/`ADD`.** The build context is this overlay directory, which does not contain the skill directories. Fetch inside a `RUN`.
+- **No `FROM`.** It would start a new stage and discard every earlier layer.
+- **Order is append-only per project.** A newly accepted skill is appended, so existing layers stay cached. Don't try to control where your fragment lands.
+- **Editing a fragment costs everyone a rebuild.** A user-wide skill's fragment is shared by every project that accepted it; each is prompted to confirm the rebuild at its next launch. Write the fragment once and leave it alone — the same discipline as the bottom of this Dockerfile.
+
+Check what is currently contributed with `claude-container --skills-fragments` (run it on the host).
+
+Something needed by exactly one project belongs in this workspace's `Dockerfile`, not in a skill fragment. Reach for a fragment only when the install is genuinely reusable across projects.

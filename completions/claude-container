@@ -26,6 +26,7 @@ _claude_container_completion() {
         --skills-accept
         --skills-reject
         --skills-reset
+        --skills-fragments
         --services
         --service-port
         --router-start
@@ -50,7 +51,7 @@ _claude_container_completion() {
     local skill_flags="--skills-adopt --skills-drop --skills-accept --skills-reject"
 
     # Flags that don't take arguments (actions)
-    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --skills --skills-reset --services --router-start --router-stop --router-status --router-logs --pull --shell --tmux --version -v --help -h"
+    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --skills --skills-reset --skills-fragments --services --router-start --router-stop --router-status --router-logs --pull --shell --tmux --version -v --help -h"
 
     case "$prev" in
         --workspace|-w|--config|-c|--proxy-data|--mount)

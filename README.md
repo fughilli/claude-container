@@ -197,9 +197,10 @@ forwarding and named services (see the next section for the latter):
 
 Each `ports` entry is passed straight to `docker run -p`, so any value Docker
 accepts works (`host:container`, `ip:host:container`, a bare container port, or
-a `/udp` suffix). `overlay.json`, `startup.sh` and `skills/` are excluded from
-the image hash, so changing ports, services, the startup hook, or skills never
-triggers a rebuild.
+a `/udp` suffix). `overlay.json`, `startup.sh` and skill prose are excluded from
+the image hash, so changing ports, services, the startup hook, or a SKILL.md
+never triggers a rebuild. The one skill file that *is* a build input is
+`overlay.Dockerfile` — see [Skill image fragments](#skill-image-fragments).
 
 #### Runtime flags
 
@@ -433,6 +434,59 @@ Manage everything with:
 | `claude-container --skills-reset` | Forget this project's choices (prompts again next launch) |
 | `claude-container --skills-drop <name>` | Remove a skill from the user-wide set |
 | `claude-container --skills-ignore-new` | Launch without prompting; use only already-accepted skills |
+| `claude-container --skills-fragments` | Print the Dockerfile text skills add to this project's image |
+
+#### Skill image fragments
+
+A skill teaches Claude *how* to do something, which is not much use when the
+thing it teaches is "install this toolchain" — the container has no toolchain to
+install into. So a skill may also ship an `overlay.Dockerfile` next to its
+`SKILL.md`:
+
+```
+~/.config/claude-container/user-skills/my-skill/
+├── SKILL.md            # prose: runtime-only, never a build input
+└── overlay.Dockerfile  # build fragment: baked into the image
+```
+
+The effective set's fragments are concatenated **ahead of** the workspace's own
+`.claude-container-overlay/Dockerfile`, so a skill can install the foundation (a
+compiler, a runtime, Nix) that the project's own overlay then builds on. A
+project with no overlay directory at all still gets an image if a skill
+contributes one.
+
+Two properties make this safe to live with:
+
+**Order is per-project and append-only.** The order is recorded in
+`~/.config/claude-container/skill-choices/<project>.order`, and a name keeps the
+slot it was first given. Accepting a new skill *appends* a layer rather than
+inserting one, so previously built layers stay cached. Names are never pruned:
+rejecting a skill and later re-accepting it restores its original position, which
+resolves to the same image hash — no rebuild at all.
+
+**Rebuilds caused by a skill are confirmed, not silent.** A user-wide skill is
+shared across every project that accepted it, so editing one would otherwise
+re-bake all of their images and run the new fragment as root in each. When the
+fragment block changes out from under a project, the launch asks first:
+
+```
+Skill image fragments changed for this project.
+Contributing skills (in build order): bazel-polyglot-nix
+Rebuilding runs their Dockerfile fragments as root in this image.
+Review with: claude-container --skills-fragments
+Rebuild the image now? [y]es / [n]o, keep the current image:
+```
+
+Declining keeps the previously built image and asks again next launch.
+Non-interactive launches rebuild without prompting. Changes to a project's *own*
+overlay `Dockerfile` rebuild silently, as they always have — only skill-driven
+changes prompt.
+
+Fragments **cannot `COPY`**: the docker build context is the workspace overlay
+directory, which does not contain the skill directories. Fetch what you need
+inside a `RUN` instead. A fragment containing `FROM`, `COPY` or `ADD` is warned
+about at launch (a `FROM` would start a new stage and silently discard every
+earlier layer).
 
 ### Running Inside tmux
 
