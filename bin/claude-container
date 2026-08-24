@@ -74,6 +74,14 @@ MOUNT_SPECS=()
 # live in SKILL_CHOICES_DIR (one file per workspace).
 USER_SKILLS_DIR="$CONFIG_BASE_DIR/user-skills"
 SKILL_CHOICES_DIR="$CONFIG_BASE_DIR/skill-choices"
+# A skill may ship an image-build fragment beside its SKILL.md. Unlike SKILL.md
+# (a runtime-only input), this text is concatenated into the effective overlay
+# Dockerfile and RUNS AS ROOT at image build time -- see collect_skill_fragments.
+SKILL_FRAGMENT_FILE="overlay.Dockerfile"
+# Set by collect_skill_fragments: the concatenated fragment text, and the
+# ordered names of the skills that contributed it.
+SKILL_FRAGMENT_BUILD=""
+SKILL_FRAGMENT_NAMES=()
 # Names reserved by the image's baked-in skills (the entrypoint re-deploys these
 # on every container start, so managed skills must not collide with them).
 BUNDLED_SKILL_NAMES="container-overlay container-tmux container-skills container-services"
@@ -157,6 +165,7 @@ SKILLS OPTIONS:
     --skills-accept <name>      Include a user-wide skill in this project (sticky)
     --skills-reject <name>      Exclude a user-wide skill from this project (sticky)
     --skills-reset              Forget this project's choices (prompt again next launch)
+    --skills-fragments          Print the Dockerfile text skills add to this image
     --skills-drop <name>        Remove a skill from the user-wide set
     --skills-ignore-new         Launch without prompting about undecided skills
                                 (use only what's already accepted; decide later)
@@ -220,11 +229,13 @@ WORKSPACE OVERLAY:
         │                   before Claude — for setup that needs the live
         │                   container (start a daemon, join a network).
         └── skills/<name>/  Skills proposed by Claude from inside the container
-                            (deployed at launch, never baked into the image).
+                            (deployed at launch; only an overlay.Dockerfile
+                            inside one is baked into the image -- see below).
 
     The built image is tagged claude-container-overlay:<hash> over the base
-    image plus the build inputs; overlay.json, startup.sh and skills/ are
-    excluded from the hash, so changes to them never trigger a rebuild.
+    image plus the build inputs; overlay.json, startup.sh and skills/ files
+    other than overlay.Dockerfile are excluded from the hash, so changing ports,
+    the startup hook or skill prose never triggers a rebuild.
 
     RUNTIME FLAGS are an allowlist, not a passthrough — there is deliberately
     no way to express -v, --privileged, --pid=host or --network=host, because
@@ -262,6 +273,28 @@ BUNDLED SKILLS:
     into the skills directory automatically on container start, so Claude knows
     how to use the overlay, tmux, skill-sharing, and named-service features in
     every workspace — no per-project setup required.
+
+SKILL IMAGE FRAGMENTS:
+    A skill can ship an `overlay.Dockerfile` next to its SKILL.md. The effective
+    set's fragments are concatenated ahead of the workspace's own overlay
+    Dockerfile, so a skill can install a toolchain (Nix, a compiler, a runtime)
+    that the project's overlay then builds on. Fragments run AS ROOT at image
+    build time.
+
+    Order is per-project and append-only (recorded in
+    ~/.config/claude-container/skill-choices/<project>.order): a newly accepted
+    skill is appended rather than inserted, so existing layers stay cached. A
+    name keeps its slot forever -- rejecting and re-accepting a skill restores
+    its original position at no rebuild cost.
+
+    Fragments cannot COPY: the docker build context is the workspace overlay
+    directory, which does not contain the skill directories. Fetch inside a RUN.
+
+    Because a user-wide skill is shared across projects, editing one changes the
+    image of every project that accepted it. That rebuild is CONFIRMED at launch
+    rather than performed silently; declining keeps the previously built image
+    and asks again next launch. Review the exact text first with
+    --skills-fragments.
 
 SKILL SHARING:
     Claude can propose new skills from inside the container by writing them to
@@ -434,8 +467,36 @@ choices_file() {
     printf '%s/%s.conf\n' "$SKILL_CHOICES_DIR" "$(project_key "$SKILL_IDENTITY_DIR")"
 }
 
+# Per-project record of the ORDER in which skill fragments are concatenated.
+# Append-only: a name keeps the slot it was first given, so adopting a new skill
+# appends a layer rather than inserting one and invalidating everything after
+# it. Names are never pruned -- a skill that is rejected and later re-accepted
+# returns to its original slot, costing no rebuild.
+skill_order_file() {
+    if [ -z "${SKILL_IDENTITY_DIR:-}" ]; then
+        SKILL_IDENTITY_DIR="$(skill_identity_dir)"
+    fi
+    printf '%s/%s.order\n' "$SKILL_CHOICES_DIR" "$(project_key "$SKILL_IDENTITY_DIR")"
+}
+
+# Per-project record of the last overlay image actually built, and the digest of
+# the skill-fragment block it was built from. Lets the launcher tell "the
+# fragments changed under this project" (confirm before rebuilding) apart from
+# "this project's own overlay changed" (rebuild silently, as before).
+skill_build_state_file() {
+    if [ -z "${SKILL_IDENTITY_DIR:-}" ]; then
+        SKILL_IDENTITY_DIR="$(skill_identity_dir)"
+    fi
+    printf '%s/%s.build\n' "$SKILL_CHOICES_DIR" "$(project_key "$SKILL_IDENTITY_DIR")"
+}
+
 valid_skill_name() {
     [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]
+}
+
+# True when a skill directory ships an image-build fragment.
+skill_has_fragment() {
+    [ -f "$1/$SKILL_FRAGMENT_FILE" ]
 }
 
 is_bundled_skill() {
@@ -508,6 +569,11 @@ prompt_undecided_skills() {
         fi
         desc="$(skill_description "$USER_SKILLS_DIR/$name")"
         echo -e "${BLUE}New user-wide skill:${NC} ${YELLOW}${name}${NC}${desc:+ — $desc}"
+        if skill_has_fragment "$USER_SKILLS_DIR/$name"; then
+            echo -e "${YELLOW}  This skill ships an image-build fragment: accepting it rebuilds this${NC}"
+            echo -e "${YELLOW}  project's container image and runs that fragment as root at build time.${NC}"
+            echo -e "${YELLOW}  Read it first: $USER_SKILLS_DIR/$name/$SKILL_FRAGMENT_FILE${NC}"
+        fi
         while true; do
             printf 'Include it in this project? [y]es / [n]o / [s]kip for now: '
             read -r answer < /dev/tty || answer="s"
@@ -621,6 +687,101 @@ sync_skills() {
     return 0
 }
 
+# Concatenate the image-build fragments shipped by the effective skill set into
+# SKILL_FRAGMENT_BUILD, in a per-project append-only order (see
+# skill_order_file). Mirrors sync_skills' membership rules: workspace skills,
+# then accepted user-wide ones, with the workspace copy winning a name
+# collision.
+#
+# The result is prepended to the workspace's own overlay Dockerfile, so skills
+# provide the foundation (a toolchain, an interpreter, Nix) and the project's
+# own fragment can build on top of it. That ordering costs a rebuild of the
+# workspace fragment's layers when a skill is added -- the cheap, volatile end
+# of the image -- while leaving the expensive shared skill layers cached.
+#
+# Fragments cannot COPY: the docker build context is the workspace overlay
+# directory, which does not contain the skill dirs. Fetch inside a RUN instead.
+collect_skill_fragments() {
+    local order_file name src frag existing found
+    local -a ordered
+    SKILL_FRAGMENT_BUILD=""
+    SKILL_FRAGMENT_NAMES=()
+    ordered=()
+
+    order_file="$(skill_order_file)"
+    if [ -f "$order_file" ]; then
+        while IFS= read -r name; do
+            if [ -n "$name" ] && valid_skill_name "$name"; then
+                ordered+=("$name")
+            fi
+        done < "$order_file"
+    fi
+
+    # Append names that carry a fragment and aren't in the recorded order yet.
+    for name in $(list_skill_dirs "$WORKSPACE_SKILLS_DIR") $(list_skill_dirs "$USER_SKILLS_DIR"); do
+        if ! valid_skill_name "$name" || is_bundled_skill "$name"; then
+            continue
+        fi
+        src="$(skill_fragment_source "$name")" || continue
+        found=false
+        for existing in ${ordered[@]+"${ordered[@]}"}; do
+            if [ "$existing" = "$name" ]; then
+                found=true
+            fi
+        done
+        if [ "$found" = false ]; then
+            ordered+=("$name")
+        fi
+    done
+
+    if [ ${#ordered[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    mkdir -p "$SKILL_CHOICES_DIR"
+    printf '%s\n' "${ordered[@]}" > "$order_file"
+
+    # Emit in recorded order, skipping names that no longer contribute one.
+    for name in "${ordered[@]}"; do
+        src="$(skill_fragment_source "$name")" || continue
+        frag="$(cat "$src")"
+        if printf '%s\n' "$frag" | grep -qiE '^[[:space:]]*(FROM|COPY|ADD)[[:space:]]'; then
+            echo -e "${YELLOW}Warning: skill '$name' fragment uses FROM/COPY/ADD.${NC}"
+            echo -e "${YELLOW}FROM starts a new stage and discards earlier layers; COPY/ADD cannot see${NC}"
+            echo -e "${YELLOW}the skill directory (the build context is the workspace overlay dir).${NC}"
+        fi
+        SKILL_FRAGMENT_BUILD+="# --- claude-container: fragment from skill '$name' ---"$'\n'
+        SKILL_FRAGMENT_BUILD+="$frag"$'\n'
+        SKILL_FRAGMENT_NAMES+=("$name")
+    done
+
+    if [ ${#SKILL_FRAGMENT_NAMES[@]} -gt 0 ]; then
+        echo -e "${GREEN}Skill image fragments:${NC} ${YELLOW}${SKILL_FRAGMENT_NAMES[*]}${NC}"
+    fi
+    return 0
+}
+
+# Path to the fragment a named skill contributes for THIS project, honouring the
+# same precedence as sync_skills (workspace copy wins). Non-zero when the skill
+# contributes none, so callers can `|| continue`.
+skill_fragment_source() {
+    local name="$1"
+    if [ -f "$WORKSPACE_SKILLS_DIR/$name/SKILL.md" ]; then
+        if skill_has_fragment "$WORKSPACE_SKILLS_DIR/$name"; then
+            printf '%s\n' "$WORKSPACE_SKILLS_DIR/$name/$SKILL_FRAGMENT_FILE"
+            return 0
+        fi
+        return 1
+    fi
+    if [ -f "$USER_SKILLS_DIR/$name/SKILL.md" ] \
+        && [ "$(get_skill_choice "$name")" = "accept" ] \
+        && skill_has_fragment "$USER_SKILLS_DIR/$name"; then
+        printf '%s\n' "$USER_SKILLS_DIR/$name/$SKILL_FRAGMENT_FILE"
+        return 0
+    fi
+    return 1
+}
+
 # Point out workspace skills that haven't been adopted user-wide yet.
 suggest_adoptable_skills() {
     local name
@@ -649,6 +810,9 @@ skills_list() {
             *)      status="${YELLOW}undecided — will prompt at next launch${NC}" ;;
         esac
         desc="$(skill_description "$USER_SKILLS_DIR/$name")"
+        if skill_has_fragment "$USER_SKILLS_DIR/$name"; then
+            status="${status}; ${YELLOW}builds into the image${NC}"
+        fi
         echo -e "  ${name} [${status}]${desc:+ — $desc}"
     done
     if [ "$any" = false ]; then
@@ -665,6 +829,9 @@ skills_list() {
             status="always active here; adopt with --skills-adopt $name"
         fi
         desc="$(skill_description "$WORKSPACE_SKILLS_DIR/$name")"
+        if skill_has_fragment "$WORKSPACE_SKILLS_DIR/$name"; then
+            status="${status}; builds into the image"
+        fi
         echo -e "  ${name} [${status}]${desc:+ — $desc}"
     done
     if [ "$any" = false ]; then
@@ -673,6 +840,26 @@ skills_list() {
     echo ""
     echo -e "Project: ${YELLOW}${WORKSPACE_DIR}${NC}"
     echo -e "Choices: ${YELLOW}$(choices_file)${NC}"
+    return 0
+}
+
+# Print the exact Dockerfile text the effective skill set contributes to this
+# project's image, in build order. This runs as root at image build time, so it
+# is worth reading before accepting a rebuild.
+skills_fragments() {
+    collect_skill_fragments >/dev/null
+    if [ ${#SKILL_FRAGMENT_NAMES[@]} -eq 0 ]; then
+        echo "No skill active in this project contributes an image fragment."
+        echo ""
+        echo -e "Order file: ${YELLOW}$(skill_order_file)${NC}"
+        return 0
+    fi
+    echo -e "${GREEN}Skill image fragments${NC} (build order; prepended to this project's overlay Dockerfile):"
+    echo ""
+    printf '%s' "$SKILL_FRAGMENT_BUILD"
+    echo ""
+    echo -e "Order file: ${YELLOW}$(skill_order_file)${NC}"
+    echo -e "Build state: ${YELLOW}$(skill_build_state_file)${NC}"
     return 0
 }
 
@@ -1221,6 +1408,10 @@ while [[ $# -gt 0 ]]; do
             SKILLS_ACTION="reset"
             shift
             ;;
+        --skills-fragments)
+            SKILLS_ACTION="fragments"
+            shift
+            ;;
         --skills-ignore-new)
             SKILLS_IGNORE_NEW=true
             shift
@@ -1322,6 +1513,7 @@ if [ -n "$SKILLS_ACTION" ]; then
         accept) skills_set_project_choice "$SKILLS_NAME" accept ;;
         reject) skills_set_project_choice "$SKILLS_NAME" reject ;;
         reset)  skills_reset ;;
+        fragments) skills_fragments ;;
     esac
     exit 0
 fi
@@ -1458,6 +1650,7 @@ CC_CONTAINER_NAME="cc-$(project_key)-$$"
 WORKSPACE_SKILLS_DIR="$WORKSPACE_DIR/.claude-container-overlay/skills"
 prompt_undecided_skills
 sync_skills
+collect_skill_fragments
 suggest_adoptable_skills
 
 # Overlay support: .claude-container-overlay at the workspace root layers
@@ -1678,6 +1871,14 @@ elif [ -f "$OVERLAY_PATH" ]; then
     done < "$OVERLAY_PATH"
 fi
 
+# Skill-provided fragments go FIRST, so the workspace's own overlay can build on
+# what they install. A project with no overlay directory still gets an image
+# when a skill contributes one (OVERLAY_CONTEXT stays empty and the build runs
+# from a temporary context below).
+if [ -n "$SKILL_FRAGMENT_BUILD" ]; then
+    OVERLAY_BUILD="$SKILL_FRAGMENT_BUILD$OVERLAY_BUILD"
+fi
+
 if [ ${#PORT_MAPPINGS[@]} -gt 0 ]; then
     echo -e "${GREEN}Publishing overlay ports:${NC} ${YELLOW}${PORT_MAPPINGS[*]}${NC}"
 fi
@@ -1751,6 +1952,69 @@ if [ -n "$OVERLAY_BUILD" ]; then
     fi
     OVERLAY_IMAGE="claude-container-overlay:${OVERLAY_HASH}"
 
+    # Confirm-before-rebuild, for rebuilds caused by SKILLS rather than by this
+    # project. A user-wide skill is shared, so editing one (or adopting a new
+    # one) would otherwise silently re-bake the image of every project that
+    # accepted it, running that skill's fragment as root in each. Compare the
+    # current fragment block against the one this project last built from: only
+    # a change there prompts. A change to the project's own overlay Dockerfile
+    # rebuilds silently, exactly as before this feature existed.
+    SKILL_FRAGMENT_DIGEST=$(printf '%s' "$SKILL_FRAGMENT_BUILD" | sha256_12)
+    BUILD_STATE_FILE="$(skill_build_state_file)"
+    PREV_FRAGMENT_DIGEST=""
+    PREV_OVERLAY_IMAGE=""
+    if [ -f "$BUILD_STATE_FILE" ]; then
+        PREV_FRAGMENT_DIGEST="$(sed -n 's/^fragments=//p' "$BUILD_STATE_FILE" | tail -1)"
+        PREV_OVERLAY_IMAGE="$(sed -n 's/^image=//p' "$BUILD_STATE_FILE" | tail -1)"
+    fi
+
+    # "No recorded state" counts as a change: a project that has never built with
+    # fragments is exactly the case where skills are about to alter its image for
+    # the first time, which is the moment worth confirming. Projects with no
+    # fragments at all never reach this and rebuild silently, as before.
+    if ! docker image inspect "$OVERLAY_IMAGE" >/dev/null 2>&1 \
+        && [ "$PREV_FRAGMENT_DIGEST" != "$SKILL_FRAGMENT_DIGEST" ] \
+        && { [ -n "$SKILL_FRAGMENT_BUILD" ] || [ -n "$PREV_FRAGMENT_DIGEST" ]; }; then
+        if [ -z "$PREV_FRAGMENT_DIGEST" ]; then
+            echo -e "${YELLOW}Skills will build into this project's image for the first time.${NC}"
+        else
+            echo -e "${YELLOW}Skill image fragments changed for this project.${NC}"
+        fi
+        if [ ${#SKILL_FRAGMENT_NAMES[@]} -gt 0 ]; then
+            echo -e "${YELLOW}Contributing skills (in build order):${NC} ${SKILL_FRAGMENT_NAMES[*]}"
+        else
+            echo -e "${YELLOW}No skill now contributes a fragment (one was removed or rejected).${NC}"
+        fi
+        echo -e "${YELLOW}Rebuilding runs their Dockerfile fragments as root in this image.${NC}"
+        echo -e "${YELLOW}Review with: claude-container --skills-fragments${NC}"
+        if [ ! -t 0 ] || [ ! -t 1 ]; then
+            echo -e "${BLUE}Non-interactive launch — rebuilding.${NC}"
+        else
+            while true; do
+                printf 'Rebuild the image now? [y]es / [n]o, keep the current image: '
+                read -r answer < /dev/tty || answer="y"
+                case "$answer" in
+                    y|Y|yes|"")
+                        break
+                        ;;
+                    n|N|no)
+                        if [ -n "$PREV_OVERLAY_IMAGE" ] && docker image inspect "$PREV_OVERLAY_IMAGE" >/dev/null 2>&1; then
+                            echo -e "${BLUE}Keeping ${PREV_OVERLAY_IMAGE}; the new fragments are NOT in it.${NC}"
+                            echo -e "${BLUE}You'll be asked again next launch.${NC}"
+                            OVERLAY_IMAGE="$PREV_OVERLAY_IMAGE"
+                        else
+                            echo -e "${YELLOW}The previously built image is gone; rebuilding anyway.${NC}"
+                        fi
+                        break
+                        ;;
+                    *)
+                        echo "Please answer y or n."
+                        ;;
+                esac
+            done
+        fi
+    fi
+
     if ! docker image inspect "$OVERLAY_IMAGE" >/dev/null 2>&1; then
         # Footgun guard: if the base ($IMAGE) is itself an overlay image, the
         # overlay's build steps get re-applied on top of it. Because the parent
@@ -1788,6 +2052,18 @@ if [ -n "$OVERLAY_BUILD" ]; then
             rm -rf "$BUILD_DIR"
             trap - EXIT
         fi
+    fi
+    # Record what this project is actually running, so the next launch can tell
+    # a skill-driven change apart from a project-driven one. Written whether or
+    # not a build just happened: declining a rebuild must not leave the recorded
+    # digest stale, or the prompt would never fire again.
+    if [ "$OVERLAY_IMAGE" = "claude-container-overlay:${OVERLAY_HASH}" ]; then
+        mkdir -p "$SKILL_CHOICES_DIR"
+        {
+            printf '# claude-container: last overlay image built for this project\n'
+            printf 'image=%s\n' "$OVERLAY_IMAGE"
+            printf 'fragments=%s\n' "$SKILL_FRAGMENT_DIGEST"
+        } > "$BUILD_STATE_FILE"
     fi
     IMAGE="$OVERLAY_IMAGE"
 fi
