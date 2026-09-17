@@ -80,6 +80,18 @@ The installer:
 - builds the container image from `claude-code/` and tags it with the version
   the launcher expects (shadowing the Docker Hub image of the same name).
 
+Optionally, it also wires up the service router (see
+[Named Services](#named-services)):
+
+- `--autostart` installs a per-user login service (launchd on macOS, a
+  `systemd --user` unit on Linux) so the router is up from login on, rather than
+  only once you have launched a container,
+- `--tailnet` puts `tailscale serve` in front of the router so your phone or
+  another machine on the same tailnet can open its services (implies
+  `--autostart`).
+
+Both have `--remove-` counterparts.
+
 It is idempotent — re-running it is also the update path after `git pull` or
 after editing `claude-code/` (the rebuild is cached, so unchanged layers cost
 nothing). See `./install.sh --help` for options (`--system` for
@@ -339,10 +351,67 @@ Router management: `--router-start`, `--router-stop`, `--router-status`,
 (best-effort extra listeners, default `80`), `CLAUDE_ROUTER_DNS_PORT` (8453),
 `CLAUDE_ROUTER_DOMAIN` (`claude`), `CLAUDE_ROUTER_BIND` (`127.0.0.1`). State
 lives in `~/.config/claude-container/` (`services/` registrations,
-`router.log`, `router.pid`). Everything binds to loopback only.
+`router.log`, `router.pid`). Everything binds to loopback only — see
+[Reaching services from another device](#reaching-services-from-another-device)
+to get at them from your phone without changing that.
 
 When to still use `"ports"`: something outside the machine must reach in on a
 well-known port, a config hardcodes a port number, or the protocol is UDP.
+
+#### Keeping the router up
+
+The router starts on demand — every container launch runs
+`claude-container-router ensure`. That covers the normal case, but right after a
+reboot, before any container has run, there is nothing listening. To close that
+gap:
+
+```bash
+./install.sh --autostart      # launchd on macOS, systemd --user on Linux
+```
+
+The service respawns the router if it crashes, but a deliberate
+`claude-container --router-stop` stays stopped rather than fighting the service
+manager. Restart it with `launchctl kickstart gui/$(id -u)/com.claude-container.router`
+(macOS) or `systemctl --user start claude-container-router` (Linux); on Linux,
+`sudo loginctl enable-linger $USER` keeps it running while you are logged out.
+Re-running `./install.sh` refreshes an already-installed service, and
+`--remove-autostart` takes it away.
+
+#### Reaching services from another device
+
+Widening `CLAUDE_ROUTER_BIND` to `0.0.0.0` would expose unauthenticated dev
+services on every interface the machine has — including whatever public Wi-Fi it
+is on. Instead, leave the router on loopback and put Tailscale in front of it:
+
+```bash
+./install.sh --tailnet
+```
+
+That runs `tailscale serve --bg --https=443 --set-path=/ http://127.0.0.1:8484`,
+which is tailnet-only (`serve`, not `funnel` — nothing is published to the
+internet), gets a real TLS certificate, and is subject to your tailnet ACLs.
+Services are then at:
+
+```
+https://<machine>.<tailnet>.ts.net/<instance>/<service>/
+```
+
+Other devices must use that **path form**. The `*.claude.localhost` host form
+cannot work off-machine, because `.localhost` resolves to the client's own
+loopback. The path form rewrites the request (strips the prefix, sets
+`X-Forwarded-Prefix`, forces `Connection: close`), so an app that emits
+root-absolute asset paths may render incorrectly; for those, point a dedicated
+mount at a raw forward instead:
+
+```bash
+port=$(claude-container --service-port <instance>/<service>)
+tailscale serve --bg --set-path=/<service> "http://127.0.0.1:$port"
+```
+
+`--remove-tailnet` tears the proxy down. If the `tailscale` CLI is not on your
+`PATH` — the macOS builds keep it inside the app bundle at
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale` — pass its location as
+`TAILSCALE_BIN`.
 
 ### Permissions
 
