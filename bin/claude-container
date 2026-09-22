@@ -1973,6 +1973,54 @@ build_runtime_sources() {
     ]))'
 }
 
+# Assemble the ordered BOOT drop-in list (design §5.3): the project's startup.sh
+# plus each active skill's manifest "container.startup", sorted by "container.
+# order" (default 50) then skill name. The scripts are already inside the
+# container — sync_skills deployed each skill dir under $CONFIG_DIR/skills (mounted
+# at /claude), and the project overlay is the /workspace mount — so we record
+# their CONTAINER paths, one per line in order, in $CONFIG_DIR/startup-dropins
+# (which the container sees at /claude/startup-dropins). The entrypoint runs them
+# in that order. Same-order skills run before the project hook, so a skill that
+# stands up a capability (e.g. the tailnet join) is in place first. Writes
+# nothing and clears any stale list when there are no drop-ins.
+STARTUP_DROPINS_FILE=""
+collect_startup_dropins() {
+    local out="$CONFIG_DIR/startup-dropins"
+    local name dir startup order line
+    local -a rows=()
+    while IFS=$'\t' read -r name dir; do
+        [ -n "$name" ] || continue
+        startup="$(skill_manifest_get "$dir" container.startup 2>/dev/null)" || startup=""
+        [ -n "$startup" ] || continue
+        # A drop-in path escaping the skill dir, or one that isn't actually there,
+        # is ignored rather than trusted.
+        case "$startup" in /*|*..*) continue ;; esac
+        [ -f "$dir/$startup" ] || continue
+        order="$(skill_manifest_get "$dir" container.order 2>/dev/null)" || order=""
+        case "$order" in ''|*[!0-9]*) order=50 ;; esac
+        # kind 0 (skill) sorts before kind 1 (project) at equal order.
+        rows+=("$(printf '%s\t0\t%s\t/claude/skills/%s/%s' "$order" "$name" "$name" "$startup")")
+    done < <(active_skills)
+
+    if [ -f "$OVERLAY_PATH/startup.sh" ]; then
+        rows+=("$(printf '50\t1\t\t/workspace/.claude-container-overlay/startup.sh')")
+    fi
+
+    if [ ${#rows[@]} -eq 0 ]; then
+        rm -f "$out"
+        STARTUP_DROPINS_FILE=""
+        return 0
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t$'\t' -k1,1n -k2,2n -k3,3 | cut -f4 > "$out"
+    STARTUP_DROPINS_FILE="$out"
+    local -a shown=()
+    while IFS= read -r line; do shown+=("$(basename "$line")"); done < "$out"
+    echo -e "${GREEN}Startup drop-ins (in order):${NC} ${YELLOW}${shown[*]}${NC}"
+    return 0
+}
+
 OVERLAY_PATH="$WORKSPACE_DIR/.claude-container-overlay"
 PORT_MAPPINGS=()
 OVERLAY_BUILD=""
@@ -2080,6 +2128,15 @@ if [ ${#OVERLAY_RUNTIME_ARGS[@]} -gt 0 ]; then
         prev_runtime_arg="$runtime_arg"
     done
     echo -e "${GREEN}Overlay runtime flags:${NC} ${YELLOW}${RUNTIME_SUMMARY}${NC}"
+fi
+
+# BOOT phase: assemble the ordered startup drop-in list (project startup.sh +
+# each active skill's container.startup) and point the entrypoint at it. The
+# entrypoint runs each in order, non-fatally, as the mapped user. Recomputed
+# every launch so a removed/rejected skill's drop-in falls out.
+collect_startup_dropins
+if [ -n "$STARTUP_DROPINS_FILE" ]; then
+    EXTRA_DOCKER_ARGS+=(-e "CLAUDE_STARTUP_DROPINS=/claude/startup-dropins")
 fi
 
 # Named services declared in overlay.json (display only — resolution happens
