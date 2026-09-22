@@ -173,29 +173,41 @@ if command -v expect >/dev/null 2>&1; then
 { "name": "ttyskill", "image": { "dockerfile": "Dockerfile.snippet" },
   "runtime": { "capabilities": ["NET_ADMIN"] } }
 EOF
-    # Accept via a NON-tty path would record consent; instead mark it accepted
-    # WITHOUT consent by writing the choice directly, so the launch must prompt.
-    mkdir -p "$CHOICES"
-    key="$(ls -d "$WS6" >/dev/null; basename "$WS6")"
-    # Use the launcher to accept but then delete the consent file to force a prompt.
+    # Use the launcher to accept (records consent), then delete the consent file
+    # so the launch must re-prompt for the privilege grant.
     bash "$TMP/bin/claude-container" -w "$WS6" --skills-accept ttyskill </dev/null >/dev/null 2>&1
     rm -f "$CHOICES"/ws6-*.consent
+
+    # Granting a privileged skill for the first time produces TWO prompts in one
+    # launch: the privilege-consent grant (phase 3), then the first-time image
+    # rebuild confirmation (the pre-existing fragment-build gate). Drive both with
+    # exp_continue, and reset the stub's captured Dockerfile before each launch so
+    # `fed()` reflects only this launch (it is a workspace-global file).
+    rm -f "$TMP/dockerfile-fed"
     OUT="$(expect -c "
 set timeout 20
 spawn env PATH=$TMP/bin:\$env(PATH) HOME=$HOME bash $TMP/bin/claude-container -w $WS6 --skills-ignore-new
-expect \"Grant these to this project?\" { send \"n\r\" }
-expect eof
+expect {
+  \"Grant these to this project?\" { send \"n\r\"; exp_continue }
+  \"Rebuild the image now?\" { send \"y\r\"; exp_continue }
+  eof
+}
 " 2>&1)"
     assert_contains "prompt shows the privilege diff" "$OUT" "requests these privileges"
     assert_contains "declining disables the skill" "$OUT" "disabling 'ttyskill'"
     assert_not_contains "declined skill's fragment not built" "$(fed)" "RUN echo tty-frag"
 
+    rm -f "$TMP/dockerfile-fed"
     OUT="$(expect -c "
 set timeout 20
 spawn env PATH=$TMP/bin:\$env(PATH) HOME=$HOME bash $TMP/bin/claude-container -w $WS6 --skills-ignore-new
-expect \"Grant these to this project?\" { send \"y\r\" }
-expect eof
+expect {
+  \"Grant these to this project?\" { send \"y\r\"; exp_continue }
+  \"Rebuild the image now?\" { send \"y\r\"; exp_continue }
+  eof
+}
 " 2>&1)"
+    assert_contains "granting records consent" "$OUT" "requests these privileges"
     assert_contains "granting builds the fragment" "$(fed)" "RUN echo tty-frag"
     OUT="$(launch "$WS6")"
     assert_not_contains "consent now sticky — no re-prompt" "$OUT" "requests these privileges"
