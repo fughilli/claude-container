@@ -93,6 +93,10 @@ SKILL_FRAGMENT_NAMES=()
 BUNDLED_SKILL_NAMES="container-overlay container-tmux container-skills container-services"
 SKILLS_ACTION=""
 SKILLS_NAME=""
+# Skills disabled for THIS launch by preflight (a hard `requires` failure) or a
+# withheld privilege consent. active_skills and the fragment/runtime/boot passes
+# all skip these, so a disabled skill contributes nothing this launch.
+DISABLED_SKILLS=""
 # --skills-ignore-new: launch without prompting about undecided user-wide skills
 # (use whatever has already been accepted; leave new ones undecided for later).
 SKILLS_IGNORE_NEW=false
@@ -496,6 +500,36 @@ skill_build_state_file() {
     printf '%s/%s.build\n' "$SKILL_CHOICES_DIR" "$(project_key "$SKILL_IDENTITY_DIR")"
 }
 
+# Per-project record of the privilege digest a project has CONSENTED to for each
+# privileged skill (design §6). Accepting/adopting a privileged skill records the
+# digest of its declared privileges here; a later launch re-checks it, so a skill
+# that starts requesting new privileges is not auto-granted them.
+skill_consent_file() {
+    if [ -z "${SKILL_IDENTITY_DIR:-}" ]; then
+        SKILL_IDENTITY_DIR="$(skill_identity_dir)"
+    fi
+    printf '%s/%s.consent\n' "$SKILL_CHOICES_DIR" "$(project_key "$SKILL_IDENTITY_DIR")"
+}
+
+get_skill_consent() {
+    local file
+    file="$(skill_consent_file)"
+    [ -f "$file" ] || return 0
+    sed -n "s/^$1=//p" "$file" | tail -1
+    return 0
+}
+
+set_skill_consent() {
+    local name="$1" digest="$2" file tmp
+    file="$(skill_consent_file)"
+    mkdir -p "$SKILL_CHOICES_DIR"
+    [ -f "$file" ] || printf '# claude-container per-project privilege consent (skill=digest)\n' > "$file"
+    tmp="$file.tmp"
+    grep -v "^$name=" "$file" > "$tmp" 2>/dev/null || true
+    printf '%s=%s\n' "$name" "$digest" >> "$tmp"
+    mv "$tmp" "$file"
+}
+
 valid_skill_name() {
     [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]
 }
@@ -538,13 +572,15 @@ active_skills() {
     for name in $(list_skill_dirs "$WORKSPACE_SKILLS_DIR"); do
         valid_skill_name "$name" || continue
         is_bundled_skill "$name" && continue
+        case " $DISABLED_SKILLS " in *" $name "*) continue ;; esac
         printf '%s\t%s\n' "$name" "$WORKSPACE_SKILLS_DIR/$name"
         seen="$seen$name "
     done
     for name in $(list_skill_dirs "$USER_SKILLS_DIR"); do
         valid_skill_name "$name" || continue
         is_bundled_skill "$name" && continue
-        case "$seen" in *" $name "*) continue ;; esac
+        case " $seen" in *" $name "*) continue ;; esac
+        case " $DISABLED_SKILLS " in *" $name "*) continue ;; esac
         [ "$(get_skill_choice "$name")" = "accept" ] || continue
         printf '%s\t%s\n' "$name" "$USER_SKILLS_DIR/$name"
     done
@@ -572,6 +608,235 @@ skill_fragment_file() {
 # the bare overlay.Dockerfile default).
 skill_has_fragment() {
     skill_fragment_file "$1" >/dev/null 2>&1
+}
+
+# Describe or digest the PRIVILEGES a skill directory declares (design §6). A
+# skill is "privileged" when it contributes an image layer (a root RUN), runtime
+# capabilities/devices/env, or a host service — any of these is an escalation the
+# user must consent to. `mode` is:
+#   summary   -> human-readable privilege lines (for the consent diff), rc 0
+#   digest    -> a stable 12-char digest of the enabling contributions, rc 0
+#   check     -> rc 0 if privileged, rc 1 if not (prints nothing)
+# The digest folds the fragment TEXT plus the manifest's image/runtime/
+# hostServices/container blocks, so any change to what a skill would run re-opens
+# consent. A bare overlay.Dockerfile with no manifest is privileged too (its RUN
+# still executes as root).
+skill_privilege_info() {
+    local dir="$1" mode="$2" frag
+    frag="$(skill_fragment_file "$dir" 2>/dev/null)" || frag=""
+    CC_SKILL_DIR="$dir" CC_FRAG="$frag" CC_MODE="$mode" CC_MANIFEST="$SKILL_MANIFEST_FILE" \
+        python3 - <<'PY'
+import json, hashlib, os, sys
+
+d = os.environ["CC_SKILL_DIR"]
+frag = os.environ["CC_FRAG"]
+mode = os.environ["CC_MODE"]
+manifest_path = os.path.join(d, os.environ["CC_MANIFEST"])
+
+manifest = {}
+if os.path.exists(manifest_path):
+    try:
+        manifest = json.load(open(manifest_path)) or {}
+    except Exception:
+        manifest = {}
+if not isinstance(manifest, dict):
+    manifest = {}
+
+frag_text = ""
+if frag and os.path.exists(frag):
+    try:
+        frag_text = open(frag).read()
+    except OSError:
+        frag_text = ""
+
+image = manifest.get("image") or {}
+runtime = manifest.get("runtime") or {}
+host_services = manifest.get("hostServices") or {}
+container = manifest.get("container") or {}
+
+privileged = bool(frag_text) or bool(runtime) or bool(host_services)
+if mode == "check":
+    sys.exit(0 if privileged else 1)
+
+if mode == "digest":
+    blob = json.dumps(
+        {"frag": frag_text, "runtime": runtime, "hostServices": host_services,
+         "image": image, "container": container},
+        sort_keys=True,
+    )
+    print(hashlib.sha256(blob.encode()).hexdigest()[:12])
+    sys.exit(0)
+
+# mode == "summary": one line per declared privilege.
+lines = []
+caps = runtime.get("capabilities") or []
+if isinstance(caps, str):
+    caps = [caps]
+devs = runtime.get("devices") or []
+if isinstance(devs, str):
+    devs = [devs]
+envs = runtime.get("env") or []
+if isinstance(envs, str):
+    envs = [envs]
+sysctls = runtime.get("sysctls") or {}
+ports = runtime.get("ports") or []
+if isinstance(ports, str):
+    ports = [ports]
+if caps:
+    lines.append(f"kernel capabilities: {', '.join(map(str, caps))}")
+if devs:
+    lines.append(f"host devices: {', '.join(map(str, devs))}")
+if envs:
+    lines.append(f"host env passthrough: {', '.join(str(e).split('=')[0] for e in envs)}")
+if sysctls:
+    lines.append(f"sysctls: {', '.join(sysctls)}")
+if ports:
+    lines.append(f"published ports: {', '.join(map(str, ports))}")
+if frag_text:
+    lines.append("an image build layer that RUNS AS ROOT at build time")
+if container.get("startup"):
+    lines.append(f"a boot hook: {container.get('startup')}")
+for name, svc in host_services.items():
+    start = (svc or {}).get("start", "?") if isinstance(svc, dict) else "?"
+    lines.append(f"a HOST process '{name}': {start}")
+for ln in lines:
+    print(ln)
+PY
+}
+
+skill_is_privileged() {
+    skill_privilege_info "$1" check
+}
+
+# True when a skill has been disabled for this launch (preflight/consent). Such a
+# skill is treated like a rejected one: not deployed, no fragment, no runtime, no
+# boot hook, no host service.
+skill_disabled() {
+    case " $DISABLED_SKILLS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# Print a privileged skill's privilege diff and record the project's consent to
+# the current privilege digest (design §6). Called from the explicit consent
+# surfaces: --skills-accept and --skills-adopt (running either IS the consent).
+# A no-op for a non-privileged skill.
+consent_record_for() {
+    local name="$1" dir="$2" ln
+    skill_is_privileged "$dir" || return 0
+    echo -e "${BLUE}'$name' is a privileged skill. It grants this project:${NC}"
+    while IFS= read -r ln; do
+        [ -n "$ln" ] && echo -e "  ${YELLOW}- $ln${NC}"
+    done < <(skill_privilege_info "$dir" summary)
+    set_skill_consent "$name" "$(skill_privilege_info "$dir" digest 2>/dev/null)"
+    echo -e "${BLUE}Consent recorded for this project. You'll be re-asked only if these change.${NC}"
+    return 0
+}
+
+# Preflight the active skill set BEFORE the image build / runtime merge / boot
+# assembly (design §5.5 + §6). For each active skill: validate its `requires`
+# (a launcher too old disables it; a missing host device or unset env warns), and
+# gate its declared privileges on recorded consent — an interactive launch shows
+# the privilege diff and asks; a non-interactive one warns and proceeds so
+# automation is never wedged. Disabled skills are added to DISABLED_SKILLS, which
+# every later pass skips.
+preflight_skills() {
+    local name dir digest recorded answer ln interactive=false
+    [ -t 0 ] && [ -t 1 ] && interactive=true
+    while IFS=$'\t' read -r name dir; do
+        [ -n "$name" ] || continue
+        if ! skill_requires_preflight "$name" "$dir"; then
+            DISABLED_SKILLS="$DISABLED_SKILLS $name"
+            continue
+        fi
+        skill_is_privileged "$dir" || continue
+        digest="$(skill_privilege_info "$dir" digest 2>/dev/null)"
+        recorded="$(get_skill_consent "$name")"
+        if [ -n "$digest" ] && [ "$recorded" = "$digest" ]; then
+            continue   # already consented to exactly these privileges
+        fi
+        if [ "$interactive" = false ]; then
+            if [ -z "$recorded" ]; then
+                echo -e "${YELLOW}Skill '$name' declares privileges not yet consented to (non-interactive — proceeding):${NC}" >&2
+            else
+                echo -e "${YELLOW}Skill '$name' CHANGED its requested privileges since you consented (non-interactive — proceeding):${NC}" >&2
+            fi
+            while IFS= read -r ln; do
+                [ -n "$ln" ] && echo -e "${YELLOW}    - $ln${NC}" >&2
+            done < <(skill_privilege_info "$dir" summary)
+            echo -e "${YELLOW}  Re-consent with: claude-container --skills-accept $name${NC}" >&2
+            continue
+        fi
+        if [ -z "$recorded" ]; then
+            echo -e "${BLUE}Skill '${name}' requests these privileges for this project:${NC}"
+        else
+            echo -e "${BLUE}Skill '${name}' CHANGED the privileges it requests since you last consented:${NC}"
+        fi
+        while IFS= read -r ln; do
+            [ -n "$ln" ] && echo -e "  ${YELLOW}- $ln${NC}"
+        done < <(skill_privilege_info "$dir" summary)
+        while true; do
+            printf 'Grant these to this project? [y]es / [n]o: '
+            read -r answer < /dev/tty || answer="n"
+            case "$answer" in
+                y|Y|yes)
+                    set_skill_consent "$name" "$digest"
+                    break ;;
+                n|N|no|"")
+                    echo -e "${YELLOW}  Not granted — disabling '$name' this launch (wire it by hand per its SKILL.md, or re-run and accept).${NC}"
+                    DISABLED_SKILLS="$DISABLED_SKILLS $name"
+                    break ;;
+                *) echo "Please answer y or n." ;;
+            esac
+        done
+    done < <(active_skills)
+}
+
+# Preflight a skill's `requires` block (design §5.5). Prints diagnostics and
+# returns non-zero ONLY for a hard failure that means the skill cannot work at
+# all (the launcher is older than requires.launcher) — the caller then disables
+# it. A missing host device or unset env is a WARNING: the session still opens
+# (tailnet just skips the join), and the message keeps a later cryptic failure
+# from being a mystery.
+skill_requires_preflight() {
+    local name="$1" dir="$2" req launchreq minver dev envname
+    skill_manifest_get "$dir" requires >/dev/null 2>&1 || return 0
+
+    launchreq="$(skill_manifest_get "$dir" requires.launcher 2>/dev/null)" || launchreq=""
+    if [ -n "$launchreq" ]; then
+        # Accept ">=X.Y.Z" or a bare "X.Y.Z" (treated as a minimum).
+        minver="${launchreq#>=}"
+        minver="${minver# }"
+        if [ -n "$minver" ] && [ "$(printf '%s\n%s\n' "$minver" "$VERSION" | sort -V | head -1)" != "$minver" ]; then
+            echo -e "${RED}Skill '$name' requires claude-container >= ${minver}, but this launcher is ${VERSION}.${NC}" >&2
+            echo -e "${YELLOW}  Disabling '$name' this launch; upgrade the launcher to enable it, or wire it by hand (see its SKILL.md).${NC}" >&2
+            return 1
+        fi
+    fi
+
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+        if [ ! -e "$dev" ]; then
+            echo -e "${YELLOW}Skill '$name': host device ${dev} is not present on this host.${NC}" >&2
+            echo -e "${YELLOW}  If the join/setup fails later, this is why — the Docker engine's VM must expose ${dev}.${NC}" >&2
+        fi
+    done < <(skill_manifest_get "$dir" requires.hostDevices 2>/dev/null | python3 -c 'import sys,json;
+try:
+    v=json.load(sys.stdin)
+except Exception:
+    v=[]
+[print(x) for x in ([v] if isinstance(v,str) else (v or []))]' 2>/dev/null)
+
+    while IFS= read -r envname; do
+        [ -n "$envname" ] || continue
+        if [ -z "${!envname:-}" ]; then
+            echo -e "${YELLOW}Skill '$name': env ${envname} is not set in the launching environment; the skill runs without it (its setup may be skipped).${NC}" >&2
+        fi
+    done < <(skill_manifest_get "$dir" requires.env 2>/dev/null | python3 -c 'import sys,json;
+try:
+    v=json.load(sys.stdin)
+except Exception:
+    v=[]
+[print(x) for x in ([v] if isinstance(v,str) else (v or []))]' 2>/dev/null)
+    return 0
 }
 
 is_bundled_skill() {
@@ -644,10 +909,12 @@ prompt_undecided_skills() {
         fi
         desc="$(skill_description "$USER_SKILLS_DIR/$name")"
         echo -e "${BLUE}New user-wide skill:${NC} ${YELLOW}${name}${NC}${desc:+ — $desc}"
-        if skill_has_fragment "$USER_SKILLS_DIR/$name"; then
-            echo -e "${YELLOW}  This skill ships an image-build fragment: accepting it rebuilds this${NC}"
-            echo -e "${YELLOW}  project's container image and runs that fragment as root at build time.${NC}"
-            echo -e "${YELLOW}  Read it first: $USER_SKILLS_DIR/$name/$SKILL_FRAGMENT_FILE${NC}"
+        if skill_is_privileged "$USER_SKILLS_DIR/$name"; then
+            local pln
+            echo -e "${YELLOW}  This is a PRIVILEGED skill. Accepting grants this project:${NC}"
+            while IFS= read -r pln; do
+                [ -n "$pln" ] && echo -e "${YELLOW}    - $pln${NC}"
+            done < <(skill_privilege_info "$USER_SKILLS_DIR/$name" summary)
         fi
         while true; do
             printf 'Include it in this project? [y]es / [n]o / [s]kip for now: '
@@ -655,6 +922,9 @@ prompt_undecided_skills() {
             case "$answer" in
                 y|Y|yes)
                     set_skill_choice "$name" accept
+                    if skill_is_privileged "$USER_SKILLS_DIR/$name"; then
+                        set_skill_consent "$name" "$(skill_privilege_info "$USER_SKILLS_DIR/$name" digest 2>/dev/null)"
+                    fi
                     break
                     ;;
                 n|N|no)
@@ -694,6 +964,7 @@ sync_skills() {
             echo -e "${YELLOW}Skipping workspace skill '$name': the name is reserved by an image-bundled skill.${NC}"
             continue
         fi
+        skill_disabled "$name" && continue
         names+=("$name")
         srcs+=("$WORKSPACE_SKILLS_DIR/$name")
     done
@@ -705,6 +976,7 @@ sync_skills() {
         if [ "$(get_skill_choice "$name")" != "accept" ]; then
             continue
         fi
+        skill_disabled "$name" && continue
         found=false
         for existing in "${names[@]}"; do
             if [ "$existing" = "$name" ]; then
@@ -797,6 +1069,7 @@ collect_skill_fragments() {
         if ! valid_skill_name "$name" || is_bundled_skill "$name"; then
             continue
         fi
+        skill_disabled "$name" && continue
         src="$(skill_fragment_source "$name")" || continue
         found=false
         for existing in ${ordered[@]+"${ordered[@]}"}; do
@@ -818,6 +1091,7 @@ collect_skill_fragments() {
 
     # Emit in recorded order, skipping names that no longer contribute one.
     for name in "${ordered[@]}"; do
+        skill_disabled "$name" && continue
         src="$(skill_fragment_source "$name")" || continue
         frag="$(cat "$src")"
         if printf '%s\n' "$frag" | grep -qiE '^[[:space:]]*(FROM|COPY|ADD)[[:space:]]'; then
@@ -963,6 +1237,7 @@ skills_adopt() {
     else
         echo -e "${GREEN}Adopted '$name' into the user-wide skill set.${NC}"
     fi
+    consent_record_for "$name" "$USER_SKILLS_DIR/$name"
     echo -e "${BLUE}Accepted for this project automatically; other projects are prompted at their next launch.${NC}"
     return 0
 }
@@ -997,6 +1272,7 @@ skills_set_project_choice() {
     fi
     set_skill_choice "$name" "$choice"
     if [ "$choice" = "accept" ]; then
+        consent_record_for "$name" "$USER_SKILLS_DIR/$name"
         echo -e "${GREEN}Skill '$name' accepted for this project. It will be deployed on the next launch.${NC}"
     else
         echo -e "${GREEN}Skill '$name' rejected for this project. Any deployed copy is removed on the next launch.${NC}"
@@ -1720,6 +1996,10 @@ CC_CONTAINER_NAME="cc-$(project_key)-$$"
 # could be adopted user-wide.
 WORKSPACE_SKILLS_DIR="$WORKSPACE_DIR/.claude-container-overlay/skills"
 prompt_undecided_skills
+# Preflight `requires` and privilege consent BEFORE anything is built or wired,
+# so a skill that can't run (launcher too old) or hasn't been granted its
+# privileges is disabled up front rather than failing deep in a build/boot hook.
+preflight_skills
 sync_skills
 collect_skill_fragments
 suggest_adoptable_skills
