@@ -77,7 +77,13 @@ SKILL_CHOICES_DIR="$CONFIG_BASE_DIR/skill-choices"
 # A skill may ship an image-build fragment beside its SKILL.md. Unlike SKILL.md
 # (a runtime-only input), this text is concatenated into the effective overlay
 # Dockerfile and RUNS AS ROOT at image build time -- see collect_skill_fragments.
+# A skill.json manifest (see skill_manifest_get) may point "image.dockerfile" at
+# a differently-named fragment; overlay.Dockerfile remains the zero-config default.
 SKILL_FRAGMENT_FILE="overlay.Dockerfile"
+# A skill may declare a phase-aware manifest beside its SKILL.md: image fragment,
+# runtime privileges, boot drop-in, host services, and preflight requirements.
+# See the manifest helpers below (skill_manifest_get) and docs/design.
+SKILL_MANIFEST_FILE="skill.json"
 # Set by collect_skill_fragments: the concatenated fragment text, and the
 # ordered names of the skills that contributed it.
 SKILL_FRAGMENT_BUILD=""
@@ -494,9 +500,78 @@ valid_skill_name() {
     [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]
 }
 
-# True when a skill directory ships an image-build fragment.
+# Read a dotted key out of a skill directory's skill.json manifest, printing the
+# value (scalars verbatim; objects/arrays as compact JSON). Non-zero when there
+# is no manifest, no python3, or the key is absent — so callers can `|| default`.
+# The manifest is optional: a skill with none behaves exactly as it did before
+# manifests existed (pure instructions, plus a bare overlay.Dockerfile if any).
+skill_manifest_get() {
+    local dir="$1" key="$2"
+    [ -f "$dir/$SKILL_MANIFEST_FILE" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    MF="$dir/$SKILL_MANIFEST_FILE" KEY="$key" python3 - <<'PY'
+import json, os, sys
+try:
+    data = json.load(open(os.environ["MF"]))
+except Exception:
+    sys.exit(1)
+cur = data
+for part in os.environ["KEY"].split("."):
+    if isinstance(cur, dict) and part in cur:
+        cur = cur[part]
+    else:
+        sys.exit(1)
+if cur is None:
+    sys.exit(1)
+print(json.dumps(cur) if isinstance(cur, (dict, list)) else cur)
+PY
+}
+
+# Emit "<name>\t<dir>" for each skill active in this project: workspace skills
+# first, then accepted user-wide skills, with the workspace copy winning a name
+# collision and image-bundled names excluded. This is the single source of truth
+# for "the effective skill set", mirroring sync_skills' membership rules, and is
+# reused by every phase (image fragments, runtime merge, boot drop-ins, host
+# services, preflight, and consent).
+active_skills() {
+    local name seen=" "
+    for name in $(list_skill_dirs "$WORKSPACE_SKILLS_DIR"); do
+        valid_skill_name "$name" || continue
+        is_bundled_skill "$name" && continue
+        printf '%s\t%s\n' "$name" "$WORKSPACE_SKILLS_DIR/$name"
+        seen="$seen$name "
+    done
+    for name in $(list_skill_dirs "$USER_SKILLS_DIR"); do
+        valid_skill_name "$name" || continue
+        is_bundled_skill "$name" && continue
+        case "$seen" in *" $name "*) continue ;; esac
+        [ "$(get_skill_choice "$name")" = "accept" ] || continue
+        printf '%s\t%s\n' "$name" "$USER_SKILLS_DIR/$name"
+    done
+}
+
+# Resolve the image-build fragment a skill directory contributes, honouring the
+# manifest's "image.dockerfile" (relative to the skill dir) and falling back to a
+# bare overlay.Dockerfile. Prints the fragment path; non-zero when the skill
+# contributes none. A manifest path that escapes the skill dir is ignored.
+skill_fragment_file() {
+    local dir="$1" rel
+    rel="$(skill_manifest_get "$dir" image.dockerfile 2>/dev/null)" || rel=""
+    if [ -n "$rel" ]; then
+        case "$rel" in
+            /*|*..*) return 1 ;;
+        esac
+        [ -f "$dir/$rel" ] && { printf '%s\n' "$dir/$rel"; return 0; }
+        return 1
+    fi
+    [ -f "$dir/$SKILL_FRAGMENT_FILE" ] && { printf '%s\n' "$dir/$SKILL_FRAGMENT_FILE"; return 0; }
+    return 1
+}
+
+# True when a skill directory ships an image-build fragment (manifest-declared or
+# the bare overlay.Dockerfile default).
 skill_has_fragment() {
-    [ -f "$1/$SKILL_FRAGMENT_FILE" ]
+    skill_fragment_file "$1" >/dev/null 2>&1
 }
 
 is_bundled_skill() {
@@ -767,17 +842,13 @@ collect_skill_fragments() {
 skill_fragment_source() {
     local name="$1"
     if [ -f "$WORKSPACE_SKILLS_DIR/$name/SKILL.md" ]; then
-        if skill_has_fragment "$WORKSPACE_SKILLS_DIR/$name"; then
-            printf '%s\n' "$WORKSPACE_SKILLS_DIR/$name/$SKILL_FRAGMENT_FILE"
-            return 0
-        fi
-        return 1
+        skill_fragment_file "$WORKSPACE_SKILLS_DIR/$name"
+        return $?
     fi
     if [ -f "$USER_SKILLS_DIR/$name/SKILL.md" ] \
-        && [ "$(get_skill_choice "$name")" = "accept" ] \
-        && skill_has_fragment "$USER_SKILLS_DIR/$name"; then
-        printf '%s\n' "$USER_SKILLS_DIR/$name/$SKILL_FRAGMENT_FILE"
-        return 0
+        && [ "$(get_skill_choice "$name")" = "accept" ]; then
+        skill_fragment_file "$USER_SKILLS_DIR/$name"
+        return $?
     fi
     return 1
 }
@@ -1672,111 +1743,234 @@ suggest_adoptable_skills
 # Runtime-only inputs (overlay.json, startup.sh, skills/) are excluded from the
 # hash, so changing ports, runtime flags, the startup hook or skills never
 # triggers a rebuild.
-# Translate the allowlisted runtime keys of an overlay.json into docker run
-# arguments, one per line. Kept in a function because the parser is a heredoc:
-# bash 3.2 (macOS's system bash) looks for the closing paren of a process
-# substitution without skipping heredoc bodies, so inlining it under <(...)
-# fails to parse there.
-overlay_runtime_args() {
-    OVERLAY_JSON="$1" python3 - <<'PY'
+# Fold the allowlisted runtime keys of the project overlay.json AND each active
+# skill manifest's "runtime" block into one effective set of docker run flags,
+# emitting tagged lines: "RTARG<TAB>token" (--cap-add/--device/--sysctl/-e
+# tokens, one per line) and "PORT<TAB>mapping" (a -p value). Sources are read
+# from CC_SOURCES, a JSON array of {kind: overlay|manifest, label, path}.
+#
+# The merge is a UNION with conflict detection (design §5.2):
+#   * capabilities/devices  -> set union (deduped)
+#   * env                   -> union by name (values still come from the host
+#                              environment at run time; the manifest only names
+#                              them). A by-name and a NAME=value form, or two
+#                              differing literals, for the SAME name conflict.
+#   * sysctls / ports / services -> union; the SAME key/host-port/name claimed
+#                              with a DIFFERENT value by two sources is a fatal
+#                              error naming both claimants — never silently pick.
+# A genuine cross-source conflict exits non-zero so the launcher fails loudly at
+# launch. Malformed *entries* (bad names, host-wide sysctls) are warned and
+# skipped, exactly as before, so one bad entry never takes the launch down.
+#
+# Kept in a function because the parser is a heredoc: bash 3.2 (macOS's system
+# bash) looks for the closing paren of a process substitution without skipping
+# heredoc bodies, so inlining it under <(...) fails to parse there.
+overlay_runtime_merge() {
+    python3 - <<'PY'
 import json, os, re, sys
 
-path = os.environ["OVERLAY_JSON"]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    # The ports pass above already reported the parse failure.
-    sys.exit(0)
-if not isinstance(data, dict):
-    sys.exit(0)
+sources = json.loads(os.environ.get("CC_SOURCES", "[]"))
+FATAL = 3
 
 
-def warn(msg):
-    print(f"Warning: {path}: {msg}", file=sys.stderr)
+def warn(label, msg):
+    print(f"Warning: {label}: {msg}", file=sys.stderr)
 
 
-def as_list(value, key):
+def fatal(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(FATAL)
+
+
+def as_list(value, key, label):
     """Accept a bare string as a one-element list, like "ports" does."""
+    if value is None:
+        return []
     if isinstance(value, str):
         return [value]
     if isinstance(value, list):
         return value
-    warn(f'"{key}" must be a list; ignoring it.')
+    warn(label, f'"{key}" must be a list; ignoring it.')
     return []
 
 
-out = []
-
-for cap in as_list(data.get("capabilities", []), "capabilities"):
-    if not isinstance(cap, str):
-        warn(f"ignoring non-string capability {cap!r}.")
-        continue
-    name = cap.strip().upper()
-    if name in ("ALL", "CAP_ALL"):
-        warn('refusing "ALL" in "capabilities" — list the specific capabilities the project needs.')
-        continue
-    if not re.fullmatch(r"(CAP_)?[A-Z0-9_]+", name):
-        warn(f"ignoring malformed capability {cap!r}.")
-        continue
-    out += ["--cap-add", name]
-
-for dev in as_list(data.get("devices", []), "devices"):
-    if not isinstance(dev, str):
-        warn(f"ignoring non-string device {dev!r}.")
-        continue
-    spec = dev.strip()
-    parts = spec.split(":")
-    if len(parts) > 3:
-        warn(f"ignoring malformed device {dev!r} (expected host[:container[:perms]]).")
-        continue
-    # Both the host and container paths must name a device node, so a device
-    # entry can't be repurposed into a bind mount of an arbitrary host path.
-    bad = [p for p in parts[:2] if not p.startswith("/dev/") or ".." in p.split("/")]
-    if bad:
-        warn(f"ignoring device {dev!r} — paths must be under /dev/ and free of '..'.")
-        continue
-    if len(parts) == 3 and not re.fullmatch(r"[rwm]{1,3}", parts[2]):
-        warn(f"ignoring device {dev!r} — permissions must be a combination of r, w and m.")
-        continue
-    out += ["--device", spec]
-
-# Docker only permits sysctls that are namespaced to the container; anything
-# else would be a host-wide setting and is rejected by the daemon anyway.
 SYSCTL_PREFIXES = ("net.", "fs.mqueue.", "kernel.msg", "kernel.sem", "kernel.shm")
-sysctls = data.get("sysctls", {})
-if not isinstance(sysctls, dict):
-    warn('"sysctls" must be an object of name -> value; ignoring it.')
-    sysctls = {}
-for name, value in sysctls.items():
-    if not isinstance(name, str) or not name.startswith(SYSCTL_PREFIXES):
-        warn(f"ignoring sysctl {name!r} — only container-namespaced sysctls are allowed "
-             f"({', '.join(SYSCTL_PREFIXES)}).")
-        continue
-    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
-        warn(f"ignoring sysctl {name!r} — value must be a string or number.")
-        continue
-    out += ["--sysctl", f"{name}={value}"]
 
-for entry in as_list(data.get("env", []), "env"):
-    if not isinstance(entry, str):
-        warn(f"ignoring non-string env entry {entry!r}.")
-        continue
-    name, sep, _ = entry.strip().partition("=")
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-        warn(f"ignoring malformed env entry {entry!r}.")
-        continue
-    if sep:
-        out += ["-e", entry.strip()]
-    elif name in os.environ:
-        out += ["-e", name]
-    else:
-        warn(f'"{name}" is declared in "env" but is unset in the launching environment; '
-             f"the container will not see it.")
+out = []            # ("RTARG", token) / ("PORT", mapping) in emission order
+caps = set()        # deduped capability names
+devices = set()     # deduped device specs
+env_seen = {}       # name -> ("byname",) | ("literal", value)  [+ label]
+env_unset = set()   # names warned as unset (warn once)
+sysctls = {}        # name -> (value_str, label)
+ports = {}          # host-port key -> (mapping, label)
+services = {}       # service name -> label
 
-for arg in out:
-    print(arg)
+
+def host_port_key(mapping):
+    """The host port a -p mapping pins, or None when docker assigns one (a bare
+    container port). Forms: cont | host:cont | ip:host:cont, optional /proto."""
+    m = mapping.strip()
+    proto = ""
+    if "/" in m:
+        m, proto = m.rsplit("/", 1)
+    parts = m.split(":")
+    if len(parts) == 1:
+        return None
+    hp = parts[0] if len(parts) == 2 else parts[-2]
+    hp = hp.strip()
+    return f"{hp}/{proto}" if hp else None
+
+
+for src in sources:
+    label = src.get("label", "overlay.json")
+    kind = src.get("kind", "overlay")
+    try:
+        with open(src["path"]) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        continue
+    except Exception as exc:
+        warn(label, f"could not parse: {exc}")
+        continue
+    if not isinstance(data, dict):
+        continue
+    block = data.get("runtime", {}) if kind == "manifest" else data
+    if not isinstance(block, dict):
+        warn(label, '"runtime" must be an object; ignoring it.')
+        continue
+
+    for cap in as_list(block.get("capabilities", []), "capabilities", label):
+        if not isinstance(cap, str):
+            warn(label, f"ignoring non-string capability {cap!r}.")
+            continue
+        name = cap.strip().upper()
+        if name in ("ALL", "CAP_ALL"):
+            warn(label, 'refusing "ALL" in "capabilities" — list the specific capabilities the project needs.')
+            continue
+        if not re.fullmatch(r"(CAP_)?[A-Z0-9_]+", name):
+            warn(label, f"ignoring malformed capability {cap!r}.")
+            continue
+        if name in caps:
+            continue
+        caps.add(name)
+        out += [("RTARG", "--cap-add"), ("RTARG", name)]
+
+    for dev in as_list(block.get("devices", []), "devices", label):
+        if not isinstance(dev, str):
+            warn(label, f"ignoring non-string device {dev!r}.")
+            continue
+        spec = dev.strip()
+        parts = spec.split(":")
+        if len(parts) > 3:
+            warn(label, f"ignoring malformed device {dev!r} (expected host[:container[:perms]]).")
+            continue
+        # Both the host and container paths must name a device node, so a device
+        # entry can't be repurposed into a bind mount of an arbitrary host path.
+        bad = [p for p in parts[:2] if not p.startswith("/dev/") or ".." in p.split("/")]
+        if bad:
+            warn(label, f"ignoring device {dev!r} — paths must be under /dev/ and free of '..'.")
+            continue
+        if len(parts) == 3 and not re.fullmatch(r"[rwm]{1,3}", parts[2]):
+            warn(label, f"ignoring device {dev!r} — permissions must be a combination of r, w and m.")
+            continue
+        if spec in devices:
+            continue
+        devices.add(spec)
+        out += [("RTARG", "--device"), ("RTARG", spec)]
+
+    # Docker only permits sysctls that are namespaced to the container; anything
+    # else would be a host-wide setting and is rejected by the daemon anyway.
+    sysctl_block = block.get("sysctls", {})
+    if not isinstance(sysctl_block, dict):
+        warn(label, '"sysctls" must be an object of name -> value; ignoring it.')
+        sysctl_block = {}
+    for name, value in sysctl_block.items():
+        if not isinstance(name, str) or not name.startswith(SYSCTL_PREFIXES):
+            warn(label, f"ignoring sysctl {name!r} — only container-namespaced sysctls are allowed "
+                        f"({', '.join(SYSCTL_PREFIXES)}).")
+            continue
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            warn(label, f"ignoring sysctl {name!r} — value must be a string or number.")
+            continue
+        sval = f"{value}"
+        if name in sysctls:
+            if sysctls[name][0] != sval:
+                fatal(f'sysctl "{name}" set to conflicting values: '
+                      f"{sysctls[name][0]!r} by {sysctls[name][1]}, {sval!r} by {label}.")
+            continue
+        sysctls[name] = (sval, label)
+        out += [("RTARG", "--sysctl"), ("RTARG", f"{name}={sval}")]
+
+    for entry in as_list(block.get("env", []), "env", label):
+        if not isinstance(entry, str):
+            warn(label, f"ignoring non-string env entry {entry!r}.")
+            continue
+        name, sep, _ = entry.strip().partition("=")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            warn(label, f"ignoring malformed env entry {entry!r}.")
+            continue
+        spec = ("literal", entry.strip()) if sep else ("byname",)
+        if name in env_seen:
+            if env_seen[name][0] != spec:
+                fatal(f'env "{name}" declared incompatibly by two sources '
+                      f"(last: {label}); reconcile them.")
+            continue
+        if sep:
+            env_seen[name] = (spec, label)
+            out += [("RTARG", "-e"), ("RTARG", entry.strip())]
+        elif name in os.environ:
+            env_seen[name] = (spec, label)
+            out += [("RTARG", "-e"), ("RTARG", name)]
+        elif name not in env_unset:
+            env_unset.add(name)
+            warn(label, f'"{name}" is declared in "env" but is unset in the launching environment; '
+                        f"the container will not see it.")
+
+    for port in as_list(block.get("ports", []), "ports", label):
+        if not isinstance(port, str) or not port.strip():
+            continue
+        mapping = port.strip()
+        key = host_port_key(mapping)
+        if key is not None and key in ports:
+            if ports[key][0] != mapping:
+                fatal(f"host port {key.rstrip('/')} claimed by two sources: "
+                      f"{ports[key][0]!r} ({ports[key][1]}) and {mapping!r} ({label}).")
+            continue
+        if key is not None:
+            ports[key] = (mapping, label)
+        out.append(("PORT", mapping))
+
+    svc_block = block.get("services", {})
+    if isinstance(svc_block, dict):
+        for name in svc_block:
+            if name in services and services[name] != label:
+                fatal(f'service "{name}" declared by two sources: '
+                      f"{services[name]} and {label}.")
+            services[name] = label
+
+for tag, val in out:
+    print(f"{tag}\t{val}")
 PY
+}
+
+# Emit CC_SOURCES (a JSON array) for overlay_runtime_merge: the project
+# overlay.json, then each active skill's manifest, so the project is the first
+# claimant named in any conflict message.
+build_runtime_sources() {
+    {
+        if [ -f "$OVERLAY_PATH/overlay.json" ]; then
+            printf 'overlay\tproject overlay.json\t%s\n' "$OVERLAY_PATH/overlay.json"
+        fi
+        while IFS=$'\t' read -r rt_name rt_dir; do
+            [ -n "$rt_name" ] || continue
+            if [ -f "$rt_dir/$SKILL_MANIFEST_FILE" ]; then
+                printf "manifest\tskill '%s'\t%s\n" "$rt_name" "$rt_dir/$SKILL_MANIFEST_FILE"
+            fi
+        done < <(active_skills)
+    } | python3 -c 'import sys, json; print(json.dumps([
+        {"kind": k, "label": l, "path": p}
+        for k, l, p in (ln.rstrip("\n").split("\t") for ln in sys.stdin if ln.strip())
+    ]))'
 }
 
 OVERLAY_PATH="$WORKSPACE_DIR/.claude-container-overlay"
@@ -1784,61 +1978,6 @@ PORT_MAPPINGS=()
 OVERLAY_BUILD=""
 OVERLAY_CONTEXT=""
 if [ -d "$OVERLAY_PATH" ]; then
-    # Port mappings come from overlay.json's "ports" array; each entry is passed
-    # straight to `docker run -p`.
-    if [ -f "$OVERLAY_PATH/overlay.json" ]; then
-        if command -v python3 >/dev/null 2>&1; then
-            while IFS= read -r port_mapping; do
-                if [ -n "$port_mapping" ]; then
-                    PORT_ARGS+=(-p "$port_mapping")
-                    PORT_MAPPINGS+=("$port_mapping")
-                fi
-            done < <(OVERLAY_JSON="$OVERLAY_PATH/overlay.json" python3 - <<'PY'
-import json, os, sys
-path = os.environ["OVERLAY_JSON"]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception as exc:
-    print(f"Warning: could not parse {path}: {exc}", file=sys.stderr)
-    sys.exit(0)
-ports = data.get("ports", []) if isinstance(data, dict) else []
-if isinstance(ports, str):
-    ports = [ports]
-for port in ports:
-    if isinstance(port, str) and port.strip():
-        print(port.strip())
-PY
-)
-            # Runtime docker flags. Unlike "ports", these are ALLOWLISTED and
-            # validated rather than forwarded verbatim: overlay.json is
-            # committed with the repo and applied silently at the next launch,
-            # so a cloned — or agent-written — branch must not be able to reach
-            # the host with -v /:/host, --privileged or --pid=host. Each key
-            # maps to exactly one docker flag:
-            #
-            #   "capabilities": ["NET_ADMIN"]               --cap-add NET_ADMIN
-            #   "devices":      ["/dev/net/tun"]            --device /dev/net/tun
-            #   "sysctls":      {"net.ipv4.ip_forward": 1}  --sysctl net.ipv4.ip_forward=1
-            #   "env":          ["TS_AUTHKEY"]              -e TS_AUTHKEY
-            #
-            # An "env" entry with no "=" forwards the variable BY NAME, so its
-            # value comes from the launching environment and never appears in
-            # the container's argv (keeps secrets out of `ps`). The "NAME=value"
-            # form is accepted too, for non-secret values.
-            #
-            # Like ports, these are runtime-only: overlay.json is excluded from
-            # the image hash, so changing them never triggers a rebuild.
-            while IFS= read -r runtime_arg; do
-                if [ -n "$runtime_arg" ]; then
-                    OVERLAY_RUNTIME_ARGS+=("$runtime_arg")
-                fi
-            done < <(overlay_runtime_args "$OVERLAY_PATH/overlay.json")
-        else
-            echo -e "${YELLOW}Warning: python3 not found; ignoring ports and runtime flags in overlay.json.${NC}"
-        fi
-    fi
-
     if [ -f "$OVERLAY_PATH/Dockerfile" ]; then
         OVERLAY_BUILD="$(cat "$OVERLAY_PATH/Dockerfile")"$'\n'
         OVERLAY_CONTEXT="$OVERLAY_PATH"
@@ -1869,6 +2008,50 @@ elif [ -f "$OVERLAY_PATH" ]; then
             OVERLAY_BUILD+="$overlay_line"$'\n'
         fi
     done < "$OVERLAY_PATH"
+fi
+
+# Runtime docker flags and ports: fold the project overlay.json together with
+# each active skill manifest's "runtime" block (design §5.2). Runs even without a
+# project overlay dir, so a skill adopted user-wide (e.g. tailnet) contributes
+# its capabilities/device/env by itself. Unlike the image fragments, these are
+# ALLOWLISTED and validated rather than forwarded verbatim: overlay.json is
+# committed with the repo and applied silently at the next launch, so a cloned —
+# or agent-written — branch must not reach the host with -v /:/host, --privileged
+# or --pid=host. Each key maps to exactly one docker flag:
+#
+#   "capabilities": ["NET_ADMIN"]               --cap-add NET_ADMIN
+#   "devices":      ["/dev/net/tun"]            --device /dev/net/tun
+#   "sysctls":      {"net.ipv4.ip_forward": 1}  --sysctl net.ipv4.ip_forward=1
+#   "env":          ["TS_AUTHKEY"]              -e TS_AUTHKEY
+#
+# An "env" entry with no "=" forwards the variable BY NAME, so its value comes
+# from the launching environment and never appears in the container's argv (keeps
+# secrets out of `ps`). The "NAME=value" form is accepted too, for non-secret
+# values. All of these are runtime-only: overlay.json and skill manifests are
+# excluded from the image hash, so changing them never triggers a rebuild.
+if command -v python3 >/dev/null 2>&1; then
+    CC_RT_SOURCES="$(build_runtime_sources)"
+    if [ -n "$CC_RT_SOURCES" ] && [ "$CC_RT_SOURCES" != "[]" ]; then
+        # Capture instead of piping so array appends land in this shell, and so a
+        # conflict (merger exits non-zero, having named both claimants on stderr)
+        # fails the launch loudly rather than silently dropping a claim.
+        if ! CC_RT_OUT="$(CC_SOURCES="$CC_RT_SOURCES" overlay_runtime_merge)"; then
+            echo -e "${RED}Error: conflicting runtime declarations across the project overlay and its skills.${NC}"
+            echo -e "${RED}Resolve the conflict above, or reject the offending skill, then relaunch.${NC}"
+            exit 1
+        fi
+        while IFS=$'\t' read -r rt_tag rt_val; do
+            [ -n "$rt_tag" ] || continue
+            case "$rt_tag" in
+                RTARG) OVERLAY_RUNTIME_ARGS+=("$rt_val") ;;
+                PORT)  PORT_ARGS+=(-p "$rt_val"); PORT_MAPPINGS+=("$rt_val") ;;
+            esac
+        done <<EOF_RT
+$CC_RT_OUT
+EOF_RT
+    fi
+elif [ -f "$OVERLAY_PATH/overlay.json" ]; then
+    echo -e "${YELLOW}Warning: python3 not found; ignoring ports and runtime flags in overlay.json.${NC}"
 fi
 
 # Skill-provided fragments go FIRST, so the workspace's own overlay can build on
