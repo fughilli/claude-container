@@ -115,7 +115,7 @@ NC='\033[0m' # No Color
 
 # Function to display help
 show_help() {
-    cat << EOF
+    cat << 'EOF'
 Claude Container Launcher
 
 A convenient script to run Claude Code in a Docker container with optional API logging.
@@ -125,7 +125,7 @@ USAGE:
 
 OPTIONS:
     -w, --workspace <path>      Set workspace directory (default: current directory)
-    -c, --config <path>         Set config directory (default: \$HOME/.config/claude-container/config)
+    -c, --config <path>         Set config directory (default: $HOME/.config/claude-container/config)
     -h, --help                  Show this help message
     -v, --version               Show version information (Claude Container, Claude Code, Docker)
     --pull                      Pull latest images before running
@@ -139,7 +139,7 @@ OPTIONS:
 
 PROXY OPTIONS:
     --proxy                     Enable API logging proxy
-    --proxy-data <path>         Set proxy data directory (default: \$HOME/.config/claude-container/proxy-data)
+    --proxy-data <path>         Set proxy data directory (default: $HOME/.config/claude-container/proxy-data)
     --proxy-stop                Stop and cleanup proxy container
     --proxy-logs                Show proxy container logs
 
