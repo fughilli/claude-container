@@ -77,7 +77,13 @@ SKILL_CHOICES_DIR="$CONFIG_BASE_DIR/skill-choices"
 # A skill may ship an image-build fragment beside its SKILL.md. Unlike SKILL.md
 # (a runtime-only input), this text is concatenated into the effective overlay
 # Dockerfile and RUNS AS ROOT at image build time -- see collect_skill_fragments.
+# A skill.json manifest (see skill_manifest_get) may point "image.dockerfile" at
+# a differently-named fragment; overlay.Dockerfile remains the zero-config default.
 SKILL_FRAGMENT_FILE="overlay.Dockerfile"
+# A skill may declare a phase-aware manifest beside its SKILL.md: image fragment,
+# runtime privileges, boot drop-in, host services, and preflight requirements.
+# See the manifest helpers below (skill_manifest_get) and docs/design.
+SKILL_MANIFEST_FILE="skill.json"
 # Set by collect_skill_fragments: the concatenated fragment text, and the
 # ordered names of the skills that contributed it.
 SKILL_FRAGMENT_BUILD=""
@@ -87,6 +93,10 @@ SKILL_FRAGMENT_NAMES=()
 BUNDLED_SKILL_NAMES="container-overlay container-tmux container-skills container-services"
 SKILLS_ACTION=""
 SKILLS_NAME=""
+# Skills disabled for THIS launch by preflight (a hard `requires` failure) or a
+# withheld privilege consent. active_skills and the fragment/runtime/boot passes
+# all skip these, so a disabled skill contributes nothing this launch.
+DISABLED_SKILLS=""
 # --skills-ignore-new: launch without prompting about undecided user-wide skills
 # (use whatever has already been accepted; leave new ones undecided for later).
 SKILLS_IGNORE_NEW=false
@@ -101,6 +111,17 @@ SKILLS_IGNORE_NEW=false
 # mid-session need no restart.
 SERVICES_DIR="$CONFIG_BASE_DIR/services"
 MUX_CONTAINER_PORT=7999
+# Host services: launcher-supervised HOST processes the container reaches by name
+# — the mirror of the in-container `services` above. Declared by a skill manifest
+# ("hostServices") or a project overlay.json ("hostServices"). The launcher starts
+# them before the container, health-checks, restarts per policy, and stops them on
+# exit. HOST_EXEC_ALLOW is the user-editable allowlist of program names a host
+# service may launch (the single host-exec control, design §6). See
+# start_host_services / stop_host_services.
+HOST_EXEC_ALLOW_FILE="$CONFIG_BASE_DIR/host-exec-allow"
+HOST_SVC_RUN_DIR=""
+HOST_SVC_STOPFLAG=""
+HOST_SVC_SUPERVISORS=()
 ROUTER_ACTION=""
 SERVICE_PORT_SPEC=""
 SERVICE_INSTANCE=""
@@ -115,7 +136,7 @@ NC='\033[0m' # No Color
 
 # Function to display help
 show_help() {
-    cat << EOF
+    cat << 'EOF'
 Claude Container Launcher
 
 A convenient script to run Claude Code in a Docker container with optional API logging.
@@ -125,7 +146,7 @@ USAGE:
 
 OPTIONS:
     -w, --workspace <path>      Set workspace directory (default: current directory)
-    -c, --config <path>         Set config directory (default: \$HOME/.config/claude-container/config)
+    -c, --config <path>         Set config directory (default: $HOME/.config/claude-container/config)
     -h, --help                  Show this help message
     -v, --version               Show version information (Claude Container, Claude Code, Docker)
     --pull                      Pull latest images before running
@@ -139,7 +160,7 @@ OPTIONS:
 
 PROXY OPTIONS:
     --proxy                     Enable API logging proxy
-    --proxy-data <path>         Set proxy data directory (default: \$HOME/.config/claude-container/proxy-data)
+    --proxy-data <path>         Set proxy data directory (default: $HOME/.config/claude-container/proxy-data)
     --proxy-stop                Stop and cleanup proxy container
     --proxy-logs                Show proxy container logs
 
@@ -490,13 +511,343 @@ skill_build_state_file() {
     printf '%s/%s.build\n' "$SKILL_CHOICES_DIR" "$(project_key "$SKILL_IDENTITY_DIR")"
 }
 
+# Per-project record of the privilege digest a project has CONSENTED to for each
+# privileged skill (design §6). Accepting/adopting a privileged skill records the
+# digest of its declared privileges here; a later launch re-checks it, so a skill
+# that starts requesting new privileges is not auto-granted them.
+skill_consent_file() {
+    if [ -z "${SKILL_IDENTITY_DIR:-}" ]; then
+        SKILL_IDENTITY_DIR="$(skill_identity_dir)"
+    fi
+    printf '%s/%s.consent\n' "$SKILL_CHOICES_DIR" "$(project_key "$SKILL_IDENTITY_DIR")"
+}
+
+get_skill_consent() {
+    local file
+    file="$(skill_consent_file)"
+    [ -f "$file" ] || return 0
+    sed -n "s/^$1=//p" "$file" | tail -1
+    return 0
+}
+
+set_skill_consent() {
+    local name="$1" digest="$2" file tmp
+    file="$(skill_consent_file)"
+    mkdir -p "$SKILL_CHOICES_DIR"
+    [ -f "$file" ] || printf '# claude-container per-project privilege consent (skill=digest)\n' > "$file"
+    tmp="$file.tmp"
+    grep -v "^$name=" "$file" > "$tmp" 2>/dev/null || true
+    printf '%s=%s\n' "$name" "$digest" >> "$tmp"
+    mv "$tmp" "$file"
+}
+
 valid_skill_name() {
     [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]
 }
 
-# True when a skill directory ships an image-build fragment.
+# Read a dotted key out of a skill directory's skill.json manifest, printing the
+# value (scalars verbatim; objects/arrays as compact JSON). Non-zero when there
+# is no manifest, no python3, or the key is absent — so callers can `|| default`.
+# The manifest is optional: a skill with none behaves exactly as it did before
+# manifests existed (pure instructions, plus a bare overlay.Dockerfile if any).
+skill_manifest_get() {
+    local dir="$1" key="$2"
+    [ -f "$dir/$SKILL_MANIFEST_FILE" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    MF="$dir/$SKILL_MANIFEST_FILE" KEY="$key" python3 - <<'PY'
+import json, os, sys
+try:
+    data = json.load(open(os.environ["MF"]))
+except Exception:
+    sys.exit(1)
+cur = data
+for part in os.environ["KEY"].split("."):
+    if isinstance(cur, dict) and part in cur:
+        cur = cur[part]
+    else:
+        sys.exit(1)
+if cur is None:
+    sys.exit(1)
+print(json.dumps(cur) if isinstance(cur, (dict, list)) else cur)
+PY
+}
+
+# Emit "<name>\t<dir>" for each skill active in this project: workspace skills
+# first, then accepted user-wide skills, with the workspace copy winning a name
+# collision and image-bundled names excluded. This is the single source of truth
+# for "the effective skill set", mirroring sync_skills' membership rules, and is
+# reused by every phase (image fragments, runtime merge, boot drop-ins, host
+# services, preflight, and consent).
+active_skills() {
+    local name seen=" "
+    for name in $(list_skill_dirs "$WORKSPACE_SKILLS_DIR"); do
+        valid_skill_name "$name" || continue
+        is_bundled_skill "$name" && continue
+        case " $DISABLED_SKILLS " in *" $name "*) continue ;; esac
+        printf '%s\t%s\n' "$name" "$WORKSPACE_SKILLS_DIR/$name"
+        seen="$seen$name "
+    done
+    for name in $(list_skill_dirs "$USER_SKILLS_DIR"); do
+        valid_skill_name "$name" || continue
+        is_bundled_skill "$name" && continue
+        case " $seen" in *" $name "*) continue ;; esac
+        case " $DISABLED_SKILLS " in *" $name "*) continue ;; esac
+        [ "$(get_skill_choice "$name")" = "accept" ] || continue
+        printf '%s\t%s\n' "$name" "$USER_SKILLS_DIR/$name"
+    done
+}
+
+# Resolve the image-build fragment a skill directory contributes, honouring the
+# manifest's "image.dockerfile" (relative to the skill dir) and falling back to a
+# bare overlay.Dockerfile. Prints the fragment path; non-zero when the skill
+# contributes none. A manifest path that escapes the skill dir is ignored.
+skill_fragment_file() {
+    local dir="$1" rel
+    rel="$(skill_manifest_get "$dir" image.dockerfile 2>/dev/null)" || rel=""
+    if [ -n "$rel" ]; then
+        case "$rel" in
+            /*|*..*) return 1 ;;
+        esac
+        [ -f "$dir/$rel" ] && { printf '%s\n' "$dir/$rel"; return 0; }
+        return 1
+    fi
+    [ -f "$dir/$SKILL_FRAGMENT_FILE" ] && { printf '%s\n' "$dir/$SKILL_FRAGMENT_FILE"; return 0; }
+    return 1
+}
+
+# True when a skill directory ships an image-build fragment (manifest-declared or
+# the bare overlay.Dockerfile default).
 skill_has_fragment() {
-    [ -f "$1/$SKILL_FRAGMENT_FILE" ]
+    skill_fragment_file "$1" >/dev/null 2>&1
+}
+
+# Describe or digest the PRIVILEGES a skill directory declares (design §6). A
+# skill is "privileged" when it contributes an image layer (a root RUN), runtime
+# capabilities/devices/env, or a host service — any of these is an escalation the
+# user must consent to. `mode` is:
+#   summary   -> human-readable privilege lines (for the consent diff), rc 0
+#   digest    -> a stable 12-char digest of the enabling contributions, rc 0
+#   check     -> rc 0 if privileged, rc 1 if not (prints nothing)
+# The digest folds the fragment TEXT plus the manifest's image/runtime/
+# hostServices/container blocks, so any change to what a skill would run re-opens
+# consent. A bare overlay.Dockerfile with no manifest is privileged too (its RUN
+# still executes as root).
+skill_privilege_info() {
+    local dir="$1" mode="$2" frag
+    frag="$(skill_fragment_file "$dir" 2>/dev/null)" || frag=""
+    CC_SKILL_DIR="$dir" CC_FRAG="$frag" CC_MODE="$mode" CC_MANIFEST="$SKILL_MANIFEST_FILE" \
+        python3 - <<'PY'
+import json, hashlib, os, sys
+
+d = os.environ["CC_SKILL_DIR"]
+frag = os.environ["CC_FRAG"]
+mode = os.environ["CC_MODE"]
+manifest_path = os.path.join(d, os.environ["CC_MANIFEST"])
+
+manifest = {}
+if os.path.exists(manifest_path):
+    try:
+        manifest = json.load(open(manifest_path)) or {}
+    except Exception:
+        manifest = {}
+if not isinstance(manifest, dict):
+    manifest = {}
+
+frag_text = ""
+if frag and os.path.exists(frag):
+    try:
+        frag_text = open(frag).read()
+    except OSError:
+        frag_text = ""
+
+image = manifest.get("image") or {}
+runtime = manifest.get("runtime") or {}
+host_services = manifest.get("hostServices") or {}
+container = manifest.get("container") or {}
+
+privileged = bool(frag_text) or bool(runtime) or bool(host_services)
+if mode == "check":
+    sys.exit(0 if privileged else 1)
+
+if mode == "digest":
+    blob = json.dumps(
+        {"frag": frag_text, "runtime": runtime, "hostServices": host_services,
+         "image": image, "container": container},
+        sort_keys=True,
+    )
+    print(hashlib.sha256(blob.encode()).hexdigest()[:12])
+    sys.exit(0)
+
+# mode == "summary": one line per declared privilege.
+lines = []
+caps = runtime.get("capabilities") or []
+if isinstance(caps, str):
+    caps = [caps]
+devs = runtime.get("devices") or []
+if isinstance(devs, str):
+    devs = [devs]
+envs = runtime.get("env") or []
+if isinstance(envs, str):
+    envs = [envs]
+sysctls = runtime.get("sysctls") or {}
+ports = runtime.get("ports") or []
+if isinstance(ports, str):
+    ports = [ports]
+if caps:
+    lines.append(f"kernel capabilities: {', '.join(map(str, caps))}")
+if devs:
+    lines.append(f"host devices: {', '.join(map(str, devs))}")
+if envs:
+    lines.append(f"host env passthrough: {', '.join(str(e).split('=')[0] for e in envs)}")
+if sysctls:
+    lines.append(f"sysctls: {', '.join(sysctls)}")
+if ports:
+    lines.append(f"published ports: {', '.join(map(str, ports))}")
+if frag_text:
+    lines.append("an image build layer that RUNS AS ROOT at build time")
+if container.get("startup"):
+    lines.append(f"a boot hook: {container.get('startup')}")
+for name, svc in host_services.items():
+    start = (svc or {}).get("start", "?") if isinstance(svc, dict) else "?"
+    lines.append(f"a HOST process '{name}': {start}")
+for ln in lines:
+    print(ln)
+PY
+}
+
+skill_is_privileged() {
+    skill_privilege_info "$1" check
+}
+
+# True when a skill has been disabled for this launch (preflight/consent). Such a
+# skill is treated like a rejected one: not deployed, no fragment, no runtime, no
+# boot hook, no host service.
+skill_disabled() {
+    case " $DISABLED_SKILLS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# Print a privileged skill's privilege diff and record the project's consent to
+# the current privilege digest (design §6). Called from the explicit consent
+# surfaces: --skills-accept and --skills-adopt (running either IS the consent).
+# A no-op for a non-privileged skill.
+consent_record_for() {
+    local name="$1" dir="$2" ln
+    skill_is_privileged "$dir" || return 0
+    echo -e "${BLUE}'$name' is a privileged skill. It grants this project:${NC}"
+    while IFS= read -r ln; do
+        [ -n "$ln" ] && echo -e "  ${YELLOW}- $ln${NC}"
+    done < <(skill_privilege_info "$dir" summary)
+    set_skill_consent "$name" "$(skill_privilege_info "$dir" digest 2>/dev/null)"
+    echo -e "${BLUE}Consent recorded for this project. You'll be re-asked only if these change.${NC}"
+    return 0
+}
+
+# Preflight the active skill set BEFORE the image build / runtime merge / boot
+# assembly (design §5.5 + §6). For each active skill: validate its `requires`
+# (a launcher too old disables it; a missing host device or unset env warns), and
+# gate its declared privileges on recorded consent — an interactive launch shows
+# the privilege diff and asks; a non-interactive one warns and proceeds so
+# automation is never wedged. Disabled skills are added to DISABLED_SKILLS, which
+# every later pass skips.
+preflight_skills() {
+    local name dir digest recorded answer ln interactive=false
+    [ -t 0 ] && [ -t 1 ] && interactive=true
+    while IFS=$'\t' read -r name dir; do
+        [ -n "$name" ] || continue
+        if ! skill_requires_preflight "$name" "$dir"; then
+            DISABLED_SKILLS="$DISABLED_SKILLS $name"
+            continue
+        fi
+        skill_is_privileged "$dir" || continue
+        digest="$(skill_privilege_info "$dir" digest 2>/dev/null)"
+        recorded="$(get_skill_consent "$name")"
+        if [ -n "$digest" ] && [ "$recorded" = "$digest" ]; then
+            continue   # already consented to exactly these privileges
+        fi
+        if [ "$interactive" = false ]; then
+            if [ -z "$recorded" ]; then
+                echo -e "${YELLOW}Skill '$name' declares privileges not yet consented to (non-interactive — proceeding):${NC}" >&2
+            else
+                echo -e "${YELLOW}Skill '$name' CHANGED its requested privileges since you consented (non-interactive — proceeding):${NC}" >&2
+            fi
+            while IFS= read -r ln; do
+                [ -n "$ln" ] && echo -e "${YELLOW}    - $ln${NC}" >&2
+            done < <(skill_privilege_info "$dir" summary)
+            echo -e "${YELLOW}  Re-consent with: claude-container --skills-accept $name${NC}" >&2
+            continue
+        fi
+        if [ -z "$recorded" ]; then
+            echo -e "${BLUE}Skill '${name}' requests these privileges for this project:${NC}"
+        else
+            echo -e "${BLUE}Skill '${name}' CHANGED the privileges it requests since you last consented:${NC}"
+        fi
+        while IFS= read -r ln; do
+            [ -n "$ln" ] && echo -e "  ${YELLOW}- $ln${NC}"
+        done < <(skill_privilege_info "$dir" summary)
+        while true; do
+            printf 'Grant these to this project? [y]es / [n]o: '
+            read -r answer < /dev/tty || answer="n"
+            case "$answer" in
+                y|Y|yes)
+                    set_skill_consent "$name" "$digest"
+                    break ;;
+                n|N|no|"")
+                    echo -e "${YELLOW}  Not granted — disabling '$name' this launch (wire it by hand per its SKILL.md, or re-run and accept).${NC}"
+                    DISABLED_SKILLS="$DISABLED_SKILLS $name"
+                    break ;;
+                *) echo "Please answer y or n." ;;
+            esac
+        done
+    done < <(active_skills)
+}
+
+# Preflight a skill's `requires` block (design §5.5). Prints diagnostics and
+# returns non-zero ONLY for a hard failure that means the skill cannot work at
+# all (the launcher is older than requires.launcher) — the caller then disables
+# it. A missing host device or unset env is a WARNING: the session still opens
+# (tailnet just skips the join), and the message keeps a later cryptic failure
+# from being a mystery.
+skill_requires_preflight() {
+    local name="$1" dir="$2" req launchreq minver dev envname
+    skill_manifest_get "$dir" requires >/dev/null 2>&1 || return 0
+
+    launchreq="$(skill_manifest_get "$dir" requires.launcher 2>/dev/null)" || launchreq=""
+    if [ -n "$launchreq" ]; then
+        # Accept ">=X.Y.Z" or a bare "X.Y.Z" (treated as a minimum).
+        minver="${launchreq#>=}"
+        minver="${minver# }"
+        if [ -n "$minver" ] && [ "$(printf '%s\n%s\n' "$minver" "$VERSION" | sort -V | head -1)" != "$minver" ]; then
+            echo -e "${RED}Skill '$name' requires claude-container >= ${minver}, but this launcher is ${VERSION}.${NC}" >&2
+            echo -e "${YELLOW}  Disabling '$name' this launch; upgrade the launcher to enable it, or wire it by hand (see its SKILL.md).${NC}" >&2
+            return 1
+        fi
+    fi
+
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+        if [ ! -e "$dev" ]; then
+            echo -e "${YELLOW}Skill '$name': host device ${dev} is not present on this host.${NC}" >&2
+            echo -e "${YELLOW}  If the join/setup fails later, this is why — the Docker engine's VM must expose ${dev}.${NC}" >&2
+        fi
+    done < <(skill_manifest_get "$dir" requires.hostDevices 2>/dev/null | python3 -c 'import sys,json;
+try:
+    v=json.load(sys.stdin)
+except Exception:
+    v=[]
+[print(x) for x in ([v] if isinstance(v,str) else (v or []))]' 2>/dev/null)
+
+    while IFS= read -r envname; do
+        [ -n "$envname" ] || continue
+        if [ -z "${!envname:-}" ]; then
+            echo -e "${YELLOW}Skill '$name': env ${envname} is not set in the launching environment; the skill runs without it (its setup may be skipped).${NC}" >&2
+        fi
+    done < <(skill_manifest_get "$dir" requires.env 2>/dev/null | python3 -c 'import sys,json;
+try:
+    v=json.load(sys.stdin)
+except Exception:
+    v=[]
+[print(x) for x in ([v] if isinstance(v,str) else (v or []))]' 2>/dev/null)
+    return 0
 }
 
 is_bundled_skill() {
@@ -569,10 +920,12 @@ prompt_undecided_skills() {
         fi
         desc="$(skill_description "$USER_SKILLS_DIR/$name")"
         echo -e "${BLUE}New user-wide skill:${NC} ${YELLOW}${name}${NC}${desc:+ — $desc}"
-        if skill_has_fragment "$USER_SKILLS_DIR/$name"; then
-            echo -e "${YELLOW}  This skill ships an image-build fragment: accepting it rebuilds this${NC}"
-            echo -e "${YELLOW}  project's container image and runs that fragment as root at build time.${NC}"
-            echo -e "${YELLOW}  Read it first: $USER_SKILLS_DIR/$name/$SKILL_FRAGMENT_FILE${NC}"
+        if skill_is_privileged "$USER_SKILLS_DIR/$name"; then
+            local pln
+            echo -e "${YELLOW}  This is a PRIVILEGED skill. Accepting grants this project:${NC}"
+            while IFS= read -r pln; do
+                [ -n "$pln" ] && echo -e "${YELLOW}    - $pln${NC}"
+            done < <(skill_privilege_info "$USER_SKILLS_DIR/$name" summary)
         fi
         while true; do
             printf 'Include it in this project? [y]es / [n]o / [s]kip for now: '
@@ -580,6 +933,9 @@ prompt_undecided_skills() {
             case "$answer" in
                 y|Y|yes)
                     set_skill_choice "$name" accept
+                    if skill_is_privileged "$USER_SKILLS_DIR/$name"; then
+                        set_skill_consent "$name" "$(skill_privilege_info "$USER_SKILLS_DIR/$name" digest 2>/dev/null)"
+                    fi
                     break
                     ;;
                 n|N|no)
@@ -619,6 +975,7 @@ sync_skills() {
             echo -e "${YELLOW}Skipping workspace skill '$name': the name is reserved by an image-bundled skill.${NC}"
             continue
         fi
+        skill_disabled "$name" && continue
         names+=("$name")
         srcs+=("$WORKSPACE_SKILLS_DIR/$name")
     done
@@ -630,6 +987,7 @@ sync_skills() {
         if [ "$(get_skill_choice "$name")" != "accept" ]; then
             continue
         fi
+        skill_disabled "$name" && continue
         found=false
         for existing in "${names[@]}"; do
             if [ "$existing" = "$name" ]; then
@@ -722,6 +1080,7 @@ collect_skill_fragments() {
         if ! valid_skill_name "$name" || is_bundled_skill "$name"; then
             continue
         fi
+        skill_disabled "$name" && continue
         src="$(skill_fragment_source "$name")" || continue
         found=false
         for existing in ${ordered[@]+"${ordered[@]}"}; do
@@ -743,6 +1102,7 @@ collect_skill_fragments() {
 
     # Emit in recorded order, skipping names that no longer contribute one.
     for name in "${ordered[@]}"; do
+        skill_disabled "$name" && continue
         src="$(skill_fragment_source "$name")" || continue
         frag="$(cat "$src")"
         if printf '%s\n' "$frag" | grep -qiE '^[[:space:]]*(FROM|COPY|ADD)[[:space:]]'; then
@@ -767,17 +1127,13 @@ collect_skill_fragments() {
 skill_fragment_source() {
     local name="$1"
     if [ -f "$WORKSPACE_SKILLS_DIR/$name/SKILL.md" ]; then
-        if skill_has_fragment "$WORKSPACE_SKILLS_DIR/$name"; then
-            printf '%s\n' "$WORKSPACE_SKILLS_DIR/$name/$SKILL_FRAGMENT_FILE"
-            return 0
-        fi
-        return 1
+        skill_fragment_file "$WORKSPACE_SKILLS_DIR/$name"
+        return $?
     fi
     if [ -f "$USER_SKILLS_DIR/$name/SKILL.md" ] \
-        && [ "$(get_skill_choice "$name")" = "accept" ] \
-        && skill_has_fragment "$USER_SKILLS_DIR/$name"; then
-        printf '%s\n' "$USER_SKILLS_DIR/$name/$SKILL_FRAGMENT_FILE"
-        return 0
+        && [ "$(get_skill_choice "$name")" = "accept" ]; then
+        skill_fragment_file "$USER_SKILLS_DIR/$name"
+        return $?
     fi
     return 1
 }
@@ -892,6 +1248,7 @@ skills_adopt() {
     else
         echo -e "${GREEN}Adopted '$name' into the user-wide skill set.${NC}"
     fi
+    consent_record_for "$name" "$USER_SKILLS_DIR/$name"
     echo -e "${BLUE}Accepted for this project automatically; other projects are prompted at their next launch.${NC}"
     return 0
 }
@@ -926,6 +1283,7 @@ skills_set_project_choice() {
     fi
     set_skill_choice "$name" "$choice"
     if [ "$choice" = "accept" ]; then
+        consent_record_for "$name" "$USER_SKILLS_DIR/$name"
         echo -e "${GREEN}Skill '$name' accepted for this project. It will be deployed on the next launch.${NC}"
     else
         echo -e "${GREEN}Skill '$name' rejected for this project. Any deployed copy is removed on the next launch.${NC}"
@@ -1175,6 +1533,296 @@ deregister_services() {
     return 0
 }
 
+# --- Host services (design §5.4, §6) ------------------------------------------
+#
+# A host service is a HOST process the container reaches by name — the mirror of
+# the in-container `services`. The launcher starts it before the container,
+# health-checks it, restarts per policy, and stops it on exit, so a bridge like
+# host-deploy's watcher no longer has to be started by hand. Two transports:
+#   * mount — communication is over the shared repo mount (no port); the launcher
+#     just supervises the process and watches a heartbeat file.
+#   * tcp   — the process listens on a host port; the launcher allocates/validates
+#     it, injects a discovery env var (`expose`) = host.docker.internal:<port>,
+#     and maps host.docker.internal so the container can reach it.
+# The host-exec allowlist (HOST_EXEC_ALLOW_FILE) is the single control that stops
+# an adopted skill from launching host processes the user did not permit.
+
+host_exec_seed_policy() {
+    [ -f "$HOST_EXEC_ALLOW_FILE" ] && return 0
+    mkdir -p "$(dirname "$HOST_EXEC_ALLOW_FILE")"
+    cat > "$HOST_EXEC_ALLOW_FILE" <<'EOF'
+# claude-container host-exec allowlist. One program name per line: a host service
+# (declared by a skill manifest's "hostServices" or a project overlay.json) may
+# only launch a program whose name (argv[0] basename) appears here. This is the
+# host-exec control — remove entries to tighten, add to permit. The exact start
+# command of every host service is also shown in the skill's consent diff.
+python3
+python
+bazel
+bazelisk
+nix
+git
+EOF
+}
+
+host_exec_allowed() {
+    host_exec_seed_policy
+    grep -qxF "$1" "$HOST_EXEC_ALLOW_FILE" 2>/dev/null
+}
+
+# Emit CC_HS_SOURCES for collect_host_services: project overlay.json + each
+# active skill manifest, each tagged with the dir the service's script resolves
+# against (the skill dir, or the repo for a project-declared service).
+build_host_service_sources() {
+    {
+        if [ -f "$OVERLAY_PATH/overlay.json" ]; then
+            printf 'overlay\tproject overlay.json\t%s\t%s\n' "$OVERLAY_PATH/overlay.json" "$WORKSPACE_DIR"
+        fi
+        while IFS=$'\t' read -r hs_name hs_dir; do
+            [ -n "$hs_name" ] || continue
+            [ -f "$hs_dir/$SKILL_MANIFEST_FILE" ] && \
+                printf "manifest\tskill '%s'\t%s\t%s\n" "$hs_name" "$hs_dir/$SKILL_MANIFEST_FILE" "$hs_dir"
+        done < <(active_skills)
+    } | python3 -c 'import sys, json; print(json.dumps([
+        {"kind": k, "label": l, "path": p, "dir": d}
+        for k, l, p, d in (ln.rstrip("\n").split("\t") for ln in sys.stdin if ln.strip())
+    ]))'
+}
+
+# Resolve host service declarations across all sources into tab records:
+#   name  transport  restart  cwd  healthcheck  port  expose  requires_csv  dir  argv_json
+# with $REPO_ROOT/$PORT substituted, tcp ports allocated, and script-filename
+# argv tokens rewritten to absolute paths in the skill dir. A service name
+# claimed by two sources is a fatal error (exit 3), naming both.
+collect_host_services() {
+    python3 - <<'PY'
+import json, os, shlex, socket, sys
+
+sources = json.loads(os.environ.get("CC_HS_SOURCES", "[]"))
+repo = os.environ.get("CC_REPO_ROOT", "")
+
+
+def fatal(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(3)
+
+
+def warn(msg):
+    print(f"Warning: {msg}", file=sys.stderr)
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+seen = {}
+recs = []
+for src in sources:
+    label, kind, d = src.get("label"), src.get("kind"), src.get("dir") or ""
+    try:
+        data = json.load(open(src["path"]))
+    except FileNotFoundError:
+        continue
+    except Exception as exc:
+        warn(f"{label}: could not parse: {exc}")
+        continue
+    if not isinstance(data, dict):
+        continue
+    hs = data.get("hostServices") or {}
+    if not isinstance(hs, dict):
+        warn(f'{label}: "hostServices" must be an object; ignoring it.')
+        continue
+    for name, spec in hs.items():
+        if name in seen:
+            fatal(f'host service "{name}" declared by two sources: {seen[name]} and {label}.')
+        seen[name] = label
+        if not isinstance(spec, dict):
+            warn(f'{label}: host service "{name}" must be an object; ignoring it.')
+            continue
+        start = spec.get("start")
+        if not isinstance(start, str) or not start.strip():
+            warn(f'{label}: host service "{name}" has no "start"; ignoring it.')
+            continue
+        transport = spec.get("transport", "mount")
+        if transport not in ("mount", "tcp"):
+            warn(f'{label}: host service "{name}" has bad transport {transport!r}; using mount.')
+            transport = "mount"
+        restart = spec.get("restart", "on-failure")
+        if restart not in ("never", "on-failure", "always"):
+            restart = "on-failure"
+        cwd = (spec.get("cwd") or "$REPO_ROOT").replace("${REPO_ROOT}", repo).replace("$REPO_ROOT", repo)
+        if not cwd:
+            cwd = repo
+        port = ""
+        if transport == "tcp":
+            p = spec.get("port", "auto")
+            port = str(free_port()) if p in (None, "auto", "") else str(p)
+        argv = []
+        for i, tok in enumerate(shlex.split(start)):
+            if port:
+                tok = tok.replace("${PORT}", port).replace("$PORT", port)
+            if i > 0 and d and os.path.exists(os.path.join(d, tok)):
+                tok = os.path.abspath(os.path.join(d, tok))
+            argv.append(tok)
+        hc = (spec.get("healthcheck") or "")
+        if port:
+            hc = hc.replace("${PORT}", port).replace("$PORT", port)
+        expose = spec.get("expose") or ""
+        req = spec.get("requires") or []
+        if isinstance(req, str):
+            req = [req]
+        recs.append([name, transport, restart, cwd, hc, port, expose,
+                     ",".join(map(str, req)), d, json.dumps(argv)])
+
+# Records are joined with US (\x1f), NOT tab: tab is IFS whitespace, so bash read
+# would collapse the empty middle fields (no healthcheck/port/expose) and shift
+# the columns. A non-whitespace separator keeps empty fields intact.
+for r in recs:
+    print("\x1f".join(r))
+PY
+}
+
+# Per-service background supervisor: (re)start the process per its restart policy
+# until the stop flag appears, then reap it. The child runs in its own process
+# group so a kill reaps its whole tree; CC_HOST_SERVICE_ROOT tells a repo-rooted
+# watcher (e.g. hostdeploy.py) where the shared mailbox lives.
+_host_service_supervisor() {
+    local sd="$1" stopflag="$2"
+    local cwd restart root child rc
+    cwd="$(cat "$sd/cwd")"; restart="$(cat "$sd/restart")"; root="$(cat "$sd/root")"
+    local -a argv=()
+    while IFS= read -r a; do argv+=("$a"); done < "$sd/argv"
+    [ ${#argv[@]} -gt 0 ] || return 0
+    while [ ! -f "$stopflag" ]; do
+        ( cd "$cwd" 2>/dev/null && exec env CC_HOST_SERVICE_ROOT="$root" "${argv[@]}" ) >>"$sd/log" 2>&1 &
+        child=$!
+        echo "$child" > "$sd/pid"
+        while kill -0 "$child" 2>/dev/null; do
+            if [ -f "$stopflag" ]; then
+                kill -TERM "$child" 2>/dev/null
+                break
+            fi
+            sleep 0.5
+        done
+        wait "$child" 2>/dev/null; rc=$?
+        [ -f "$stopflag" ] && break
+        case "$restart" in
+            never) break ;;
+            on-failure) [ "$rc" -eq 0 ] && break ;;
+            always) : ;;
+        esac
+        sleep 1
+    done
+    return 0
+}
+
+# Best-effort readiness probe (non-fatal): a mount service is healthy once its
+# heartbeat file appears; a tcp service once its healthcheck URL answers.
+host_service_healthcheck() {
+    local name="$1" transport="$2" cwd="$3" hc="$4" i f
+    [ -n "$hc" ] || return 0
+    if [ "$transport" = "mount" ]; then
+        case "$hc" in /*) f="$hc" ;; *) f="$cwd/$hc" ;; esac
+        for i in $(seq 1 16); do
+            [ -e "$f" ] && { echo -e "${GREEN}  '$name' is up${NC} (heartbeat $f)"; return 0; }
+            sleep 0.5
+        done
+        echo -e "${YELLOW}  '$name' has not reported healthy within 8s (supervision continues; see its log).${NC}"
+    else
+        command -v curl >/dev/null 2>&1 || return 0
+        for i in $(seq 1 16); do
+            curl -fsS -o /dev/null "$hc" 2>/dev/null && { echo -e "${GREEN}  '$name' is up${NC} ($hc)"; return 0; }
+            sleep 0.5
+        done
+        echo -e "${YELLOW}  '$name' health check did not pass within 8s ($hc).${NC}"
+    fi
+    return 0
+}
+
+# Start and supervise every declared host service. Skips one whose program is not
+# in the host-exec allowlist or whose host `requires` are missing (both warn).
+# For tcp services, injects the discovery env var and maps host.docker.internal.
+start_host_services() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    local sources out
+    sources="$(build_host_service_sources)"
+    [ -n "$sources" ] && [ "$sources" != "[]" ] || return 0
+    if ! out="$(CC_HS_SOURCES="$sources" CC_REPO_ROOT="$WORKSPACE_DIR" collect_host_services)"; then
+        echo -e "${RED}Error: conflicting host service declarations across the project overlay and its skills.${NC}"
+        exit 1
+    fi
+    [ -n "$out" ] || return 0
+    HOST_SVC_RUN_DIR="$CONFIG_BASE_DIR/host-services/$$"
+    HOST_SVC_STOPFLAG="$HOST_SVC_RUN_DIR/.stop"
+    mkdir -p "$HOST_SVC_RUN_DIR"
+    local name transport restart cwd healthcheck port expose requires dir argv_json
+    while IFS=$'\x1f' read -r name transport restart cwd healthcheck port expose requires dir argv_json; do
+        [ -n "$name" ] || continue
+        local -a argv=()
+        while IFS= read -r tok; do argv+=("$tok"); done \
+            < <(printf '%s' "$argv_json" | python3 -c 'import sys, json; [print(t) for t in json.load(sys.stdin)]')
+        [ ${#argv[@]} -gt 0 ] || continue
+        local prog; prog="$(basename "${argv[0]}")"
+        if ! host_exec_allowed "$prog"; then
+            echo -e "${YELLOW}Host service '$name' NOT started: '$prog' is not in the host-exec allowlist${NC}"
+            echo -e "${YELLOW}  (${HOST_EXEC_ALLOW_FILE}). Add it there to permit this host command.${NC}"
+            continue
+        fi
+        local missing="" t
+        for t in ${requires//,/ }; do
+            [ -n "$t" ] && ! command -v "$t" >/dev/null 2>&1 && missing="$missing $t"
+        done
+        if [ -n "$missing" ]; then
+            echo -e "${YELLOW}Host service '$name' NOT started: missing host tool(s):$missing.${NC}"
+            continue
+        fi
+        if [ "$transport" = "tcp" ] && [ -n "$port" ]; then
+            [ -n "$expose" ] && EXTRA_DOCKER_ARGS+=(-e "$expose=host.docker.internal:$port")
+            case " ${EXTRA_DOCKER_ARGS[*]-} " in
+                *" host.docker.internal:host-gateway "*) : ;;
+                *) EXTRA_DOCKER_ARGS+=(--add-host "host.docker.internal:host-gateway") ;;
+            esac
+        fi
+        local sd="$HOST_SVC_RUN_DIR/$name"; mkdir -p "$sd"
+        printf '%s\n' "${argv[@]}" > "$sd/argv"
+        printf '%s' "$cwd" > "$sd/cwd"
+        printf '%s' "$restart" > "$sd/restart"
+        printf '%s' "$WORKSPACE_DIR" > "$sd/root"
+        : > "$sd/log"
+        _host_service_supervisor "$sd" "$HOST_SVC_STOPFLAG" &
+        HOST_SVC_SUPERVISORS+=($!)
+        if [ "$transport" = "tcp" ] && [ -n "$expose" ]; then
+            echo -e "${GREEN}Host service:${NC} ${YELLOW}${name}${NC} (tcp, ${expose}=host.docker.internal:${port})"
+        else
+            echo -e "${GREEN}Host service:${NC} ${YELLOW}${name}${NC} (${transport})"
+        fi
+        host_service_healthcheck "$name" "$transport" "$cwd" "$healthcheck"
+    done <<EOF_HS
+$out
+EOF_HS
+    return 0
+}
+
+stop_host_services() {
+    [ -n "$HOST_SVC_STOPFLAG" ] || return 0
+    : > "$HOST_SVC_STOPFLAG" 2>/dev/null || true
+    local pid sd
+    for pid in ${HOST_SVC_SUPERVISORS[@]+"${HOST_SVC_SUPERVISORS[@]}"}; do
+        kill "$pid" 2>/dev/null || true
+    done
+    if [ -n "$HOST_SVC_RUN_DIR" ] && [ -d "$HOST_SVC_RUN_DIR" ]; then
+        for sd in "$HOST_SVC_RUN_DIR"/*/; do
+            [ -f "$sd/pid" ] && kill "$(cat "$sd/pid")" 2>/dev/null || true
+        done
+        rm -rf "$HOST_SVC_RUN_DIR"
+    fi
+    return 0
+}
+
 # Function to stop datasette
 stop_datasette() {
     if docker ps -a --format '{{.Names}}' | grep -q "^${DATASETTE_CONTAINER_NAME}$"; then
@@ -1297,6 +1945,7 @@ start_datasette() {
 cleanup() {
     local exit_code=$?
     deregister_services
+    stop_host_services
     if [ $exit_code -ne 0 ] && [ "$USE_PROXY" = true ]; then
         echo -e "\n${YELLOW}Error occurred. Cleaning up...${NC}"
         stop_proxy
@@ -1649,6 +2298,10 @@ CC_CONTAINER_NAME="cc-$(project_key)-$$"
 # could be adopted user-wide.
 WORKSPACE_SKILLS_DIR="$WORKSPACE_DIR/.claude-container-overlay/skills"
 prompt_undecided_skills
+# Preflight `requires` and privilege consent BEFORE anything is built or wired,
+# so a skill that can't run (launcher too old) or hasn't been granted its
+# privileges is disabled up front rather than failing deep in a build/boot hook.
+preflight_skills
 sync_skills
 collect_skill_fragments
 suggest_adoptable_skills
@@ -1672,111 +2325,282 @@ suggest_adoptable_skills
 # Runtime-only inputs (overlay.json, startup.sh, skills/) are excluded from the
 # hash, so changing ports, runtime flags, the startup hook or skills never
 # triggers a rebuild.
-# Translate the allowlisted runtime keys of an overlay.json into docker run
-# arguments, one per line. Kept in a function because the parser is a heredoc:
-# bash 3.2 (macOS's system bash) looks for the closing paren of a process
-# substitution without skipping heredoc bodies, so inlining it under <(...)
-# fails to parse there.
-overlay_runtime_args() {
-    OVERLAY_JSON="$1" python3 - <<'PY'
+# Fold the allowlisted runtime keys of the project overlay.json AND each active
+# skill manifest's "runtime" block into one effective set of docker run flags,
+# emitting tagged lines: "RTARG<TAB>token" (--cap-add/--device/--sysctl/-e
+# tokens, one per line) and "PORT<TAB>mapping" (a -p value). Sources are read
+# from CC_SOURCES, a JSON array of {kind: overlay|manifest, label, path}.
+#
+# The merge is a UNION with conflict detection (design §5.2):
+#   * capabilities/devices  -> set union (deduped)
+#   * env                   -> union by name (values still come from the host
+#                              environment at run time; the manifest only names
+#                              them). A by-name and a NAME=value form, or two
+#                              differing literals, for the SAME name conflict.
+#   * sysctls / ports / services -> union; the SAME key/host-port/name claimed
+#                              with a DIFFERENT value by two sources is a fatal
+#                              error naming both claimants — never silently pick.
+# A genuine cross-source conflict exits non-zero so the launcher fails loudly at
+# launch. Malformed *entries* (bad names, host-wide sysctls) are warned and
+# skipped, exactly as before, so one bad entry never takes the launch down.
+#
+# Kept in a function because the parser is a heredoc: bash 3.2 (macOS's system
+# bash) looks for the closing paren of a process substitution without skipping
+# heredoc bodies, so inlining it under <(...) fails to parse there.
+overlay_runtime_merge() {
+    python3 - <<'PY'
 import json, os, re, sys
 
-path = os.environ["OVERLAY_JSON"]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    # The ports pass above already reported the parse failure.
-    sys.exit(0)
-if not isinstance(data, dict):
-    sys.exit(0)
+sources = json.loads(os.environ.get("CC_SOURCES", "[]"))
+FATAL = 3
 
 
-def warn(msg):
-    print(f"Warning: {path}: {msg}", file=sys.stderr)
+def warn(label, msg):
+    print(f"Warning: {label}: {msg}", file=sys.stderr)
 
 
-def as_list(value, key):
+def fatal(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(FATAL)
+
+
+def as_list(value, key, label):
     """Accept a bare string as a one-element list, like "ports" does."""
+    if value is None:
+        return []
     if isinstance(value, str):
         return [value]
     if isinstance(value, list):
         return value
-    warn(f'"{key}" must be a list; ignoring it.')
+    warn(label, f'"{key}" must be a list; ignoring it.')
     return []
 
 
-out = []
-
-for cap in as_list(data.get("capabilities", []), "capabilities"):
-    if not isinstance(cap, str):
-        warn(f"ignoring non-string capability {cap!r}.")
-        continue
-    name = cap.strip().upper()
-    if name in ("ALL", "CAP_ALL"):
-        warn('refusing "ALL" in "capabilities" — list the specific capabilities the project needs.')
-        continue
-    if not re.fullmatch(r"(CAP_)?[A-Z0-9_]+", name):
-        warn(f"ignoring malformed capability {cap!r}.")
-        continue
-    out += ["--cap-add", name]
-
-for dev in as_list(data.get("devices", []), "devices"):
-    if not isinstance(dev, str):
-        warn(f"ignoring non-string device {dev!r}.")
-        continue
-    spec = dev.strip()
-    parts = spec.split(":")
-    if len(parts) > 3:
-        warn(f"ignoring malformed device {dev!r} (expected host[:container[:perms]]).")
-        continue
-    # Both the host and container paths must name a device node, so a device
-    # entry can't be repurposed into a bind mount of an arbitrary host path.
-    bad = [p for p in parts[:2] if not p.startswith("/dev/") or ".." in p.split("/")]
-    if bad:
-        warn(f"ignoring device {dev!r} — paths must be under /dev/ and free of '..'.")
-        continue
-    if len(parts) == 3 and not re.fullmatch(r"[rwm]{1,3}", parts[2]):
-        warn(f"ignoring device {dev!r} — permissions must be a combination of r, w and m.")
-        continue
-    out += ["--device", spec]
-
-# Docker only permits sysctls that are namespaced to the container; anything
-# else would be a host-wide setting and is rejected by the daemon anyway.
 SYSCTL_PREFIXES = ("net.", "fs.mqueue.", "kernel.msg", "kernel.sem", "kernel.shm")
-sysctls = data.get("sysctls", {})
-if not isinstance(sysctls, dict):
-    warn('"sysctls" must be an object of name -> value; ignoring it.')
-    sysctls = {}
-for name, value in sysctls.items():
-    if not isinstance(name, str) or not name.startswith(SYSCTL_PREFIXES):
-        warn(f"ignoring sysctl {name!r} — only container-namespaced sysctls are allowed "
-             f"({', '.join(SYSCTL_PREFIXES)}).")
-        continue
-    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
-        warn(f"ignoring sysctl {name!r} — value must be a string or number.")
-        continue
-    out += ["--sysctl", f"{name}={value}"]
 
-for entry in as_list(data.get("env", []), "env"):
-    if not isinstance(entry, str):
-        warn(f"ignoring non-string env entry {entry!r}.")
-        continue
-    name, sep, _ = entry.strip().partition("=")
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-        warn(f"ignoring malformed env entry {entry!r}.")
-        continue
-    if sep:
-        out += ["-e", entry.strip()]
-    elif name in os.environ:
-        out += ["-e", name]
-    else:
-        warn(f'"{name}" is declared in "env" but is unset in the launching environment; '
-             f"the container will not see it.")
+out = []            # ("RTARG", token) / ("PORT", mapping) in emission order
+caps = set()        # deduped capability names
+devices = set()     # deduped device specs
+env_seen = {}       # name -> ("byname",) | ("literal", value)  [+ label]
+env_unset = set()   # names warned as unset (warn once)
+sysctls = {}        # name -> (value_str, label)
+ports = {}          # host-port key -> (mapping, label)
+services = {}       # service name -> label
 
-for arg in out:
-    print(arg)
+
+def host_port_key(mapping):
+    """The host port a -p mapping pins, or None when docker assigns one (a bare
+    container port). Forms: cont | host:cont | ip:host:cont, optional /proto."""
+    m = mapping.strip()
+    proto = ""
+    if "/" in m:
+        m, proto = m.rsplit("/", 1)
+    parts = m.split(":")
+    if len(parts) == 1:
+        return None
+    hp = parts[0] if len(parts) == 2 else parts[-2]
+    hp = hp.strip()
+    return f"{hp}/{proto}" if hp else None
+
+
+for src in sources:
+    label = src.get("label", "overlay.json")
+    kind = src.get("kind", "overlay")
+    try:
+        with open(src["path"]) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        continue
+    except Exception as exc:
+        warn(label, f"could not parse: {exc}")
+        continue
+    if not isinstance(data, dict):
+        continue
+    block = data.get("runtime", {}) if kind == "manifest" else data
+    if not isinstance(block, dict):
+        warn(label, '"runtime" must be an object; ignoring it.')
+        continue
+
+    for cap in as_list(block.get("capabilities", []), "capabilities", label):
+        if not isinstance(cap, str):
+            warn(label, f"ignoring non-string capability {cap!r}.")
+            continue
+        name = cap.strip().upper()
+        if name in ("ALL", "CAP_ALL"):
+            warn(label, 'refusing "ALL" in "capabilities" — list the specific capabilities the project needs.')
+            continue
+        if not re.fullmatch(r"(CAP_)?[A-Z0-9_]+", name):
+            warn(label, f"ignoring malformed capability {cap!r}.")
+            continue
+        if name in caps:
+            continue
+        caps.add(name)
+        out += [("RTARG", "--cap-add"), ("RTARG", name)]
+
+    for dev in as_list(block.get("devices", []), "devices", label):
+        if not isinstance(dev, str):
+            warn(label, f"ignoring non-string device {dev!r}.")
+            continue
+        spec = dev.strip()
+        parts = spec.split(":")
+        if len(parts) > 3:
+            warn(label, f"ignoring malformed device {dev!r} (expected host[:container[:perms]]).")
+            continue
+        # Both the host and container paths must name a device node, so a device
+        # entry can't be repurposed into a bind mount of an arbitrary host path.
+        bad = [p for p in parts[:2] if not p.startswith("/dev/") or ".." in p.split("/")]
+        if bad:
+            warn(label, f"ignoring device {dev!r} — paths must be under /dev/ and free of '..'.")
+            continue
+        if len(parts) == 3 and not re.fullmatch(r"[rwm]{1,3}", parts[2]):
+            warn(label, f"ignoring device {dev!r} — permissions must be a combination of r, w and m.")
+            continue
+        if spec in devices:
+            continue
+        devices.add(spec)
+        out += [("RTARG", "--device"), ("RTARG", spec)]
+
+    # Docker only permits sysctls that are namespaced to the container; anything
+    # else would be a host-wide setting and is rejected by the daemon anyway.
+    sysctl_block = block.get("sysctls", {})
+    if not isinstance(sysctl_block, dict):
+        warn(label, '"sysctls" must be an object of name -> value; ignoring it.')
+        sysctl_block = {}
+    for name, value in sysctl_block.items():
+        if not isinstance(name, str) or not name.startswith(SYSCTL_PREFIXES):
+            warn(label, f"ignoring sysctl {name!r} — only container-namespaced sysctls are allowed "
+                        f"({', '.join(SYSCTL_PREFIXES)}).")
+            continue
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            warn(label, f"ignoring sysctl {name!r} — value must be a string or number.")
+            continue
+        sval = f"{value}"
+        if name in sysctls:
+            if sysctls[name][0] != sval:
+                fatal(f'sysctl "{name}" set to conflicting values: '
+                      f"{sysctls[name][0]!r} by {sysctls[name][1]}, {sval!r} by {label}.")
+            continue
+        sysctls[name] = (sval, label)
+        out += [("RTARG", "--sysctl"), ("RTARG", f"{name}={sval}")]
+
+    for entry in as_list(block.get("env", []), "env", label):
+        if not isinstance(entry, str):
+            warn(label, f"ignoring non-string env entry {entry!r}.")
+            continue
+        name, sep, _ = entry.strip().partition("=")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            warn(label, f"ignoring malformed env entry {entry!r}.")
+            continue
+        spec = ("literal", entry.strip()) if sep else ("byname",)
+        if name in env_seen:
+            if env_seen[name][0] != spec:
+                fatal(f'env "{name}" declared incompatibly by two sources '
+                      f"(last: {label}); reconcile them.")
+            continue
+        if sep:
+            env_seen[name] = (spec, label)
+            out += [("RTARG", "-e"), ("RTARG", entry.strip())]
+        elif name in os.environ:
+            env_seen[name] = (spec, label)
+            out += [("RTARG", "-e"), ("RTARG", name)]
+        elif name not in env_unset:
+            env_unset.add(name)
+            warn(label, f'"{name}" is declared in "env" but is unset in the launching environment; '
+                        f"the container will not see it.")
+
+    for port in as_list(block.get("ports", []), "ports", label):
+        if not isinstance(port, str) or not port.strip():
+            continue
+        mapping = port.strip()
+        key = host_port_key(mapping)
+        if key is not None and key in ports:
+            if ports[key][0] != mapping:
+                fatal(f"host port {key.rstrip('/')} claimed by two sources: "
+                      f"{ports[key][0]!r} ({ports[key][1]}) and {mapping!r} ({label}).")
+            continue
+        if key is not None:
+            ports[key] = (mapping, label)
+        out.append(("PORT", mapping))
+
+    svc_block = block.get("services", {})
+    if isinstance(svc_block, dict):
+        for name in svc_block:
+            if name in services and services[name] != label:
+                fatal(f'service "{name}" declared by two sources: '
+                      f"{services[name]} and {label}.")
+            services[name] = label
+
+for tag, val in out:
+    print(f"{tag}\t{val}")
 PY
+}
+
+# Emit CC_SOURCES (a JSON array) for overlay_runtime_merge: the project
+# overlay.json, then each active skill's manifest, so the project is the first
+# claimant named in any conflict message.
+build_runtime_sources() {
+    {
+        if [ -f "$OVERLAY_PATH/overlay.json" ]; then
+            printf 'overlay\tproject overlay.json\t%s\n' "$OVERLAY_PATH/overlay.json"
+        fi
+        while IFS=$'\t' read -r rt_name rt_dir; do
+            [ -n "$rt_name" ] || continue
+            if [ -f "$rt_dir/$SKILL_MANIFEST_FILE" ]; then
+                printf "manifest\tskill '%s'\t%s\n" "$rt_name" "$rt_dir/$SKILL_MANIFEST_FILE"
+            fi
+        done < <(active_skills)
+    } | python3 -c 'import sys, json; print(json.dumps([
+        {"kind": k, "label": l, "path": p}
+        for k, l, p in (ln.rstrip("\n").split("\t") for ln in sys.stdin if ln.strip())
+    ]))'
+}
+
+# Assemble the ordered BOOT drop-in list (design §5.3): the project's startup.sh
+# plus each active skill's manifest "container.startup", sorted by "container.
+# order" (default 50) then skill name. The scripts are already inside the
+# container — sync_skills deployed each skill dir under $CONFIG_DIR/skills (mounted
+# at /claude), and the project overlay is the /workspace mount — so we record
+# their CONTAINER paths, one per line in order, in $CONFIG_DIR/startup-dropins
+# (which the container sees at /claude/startup-dropins). The entrypoint runs them
+# in that order. Same-order skills run before the project hook, so a skill that
+# stands up a capability (e.g. the tailnet join) is in place first. Writes
+# nothing and clears any stale list when there are no drop-ins.
+STARTUP_DROPINS_FILE=""
+collect_startup_dropins() {
+    local out="$CONFIG_DIR/startup-dropins"
+    local name dir startup order line
+    local -a rows=()
+    while IFS=$'\t' read -r name dir; do
+        [ -n "$name" ] || continue
+        startup="$(skill_manifest_get "$dir" container.startup 2>/dev/null)" || startup=""
+        [ -n "$startup" ] || continue
+        # A drop-in path escaping the skill dir, or one that isn't actually there,
+        # is ignored rather than trusted.
+        case "$startup" in /*|*..*) continue ;; esac
+        [ -f "$dir/$startup" ] || continue
+        order="$(skill_manifest_get "$dir" container.order 2>/dev/null)" || order=""
+        case "$order" in ''|*[!0-9]*) order=50 ;; esac
+        # kind 0 (skill) sorts before kind 1 (project) at equal order.
+        rows+=("$(printf '%s\t0\t%s\t/claude/skills/%s/%s' "$order" "$name" "$name" "$startup")")
+    done < <(active_skills)
+
+    if [ -f "$OVERLAY_PATH/startup.sh" ]; then
+        rows+=("$(printf '50\t1\t\t/workspace/.claude-container-overlay/startup.sh')")
+    fi
+
+    if [ ${#rows[@]} -eq 0 ]; then
+        rm -f "$out"
+        STARTUP_DROPINS_FILE=""
+        return 0
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t$'\t' -k1,1n -k2,2n -k3,3 | cut -f4 > "$out"
+    STARTUP_DROPINS_FILE="$out"
+    local -a shown=()
+    while IFS= read -r line; do shown+=("$(basename "$line")"); done < "$out"
+    echo -e "${GREEN}Startup drop-ins (in order):${NC} ${YELLOW}${shown[*]}${NC}"
+    return 0
 }
 
 OVERLAY_PATH="$WORKSPACE_DIR/.claude-container-overlay"
@@ -1784,61 +2608,6 @@ PORT_MAPPINGS=()
 OVERLAY_BUILD=""
 OVERLAY_CONTEXT=""
 if [ -d "$OVERLAY_PATH" ]; then
-    # Port mappings come from overlay.json's "ports" array; each entry is passed
-    # straight to `docker run -p`.
-    if [ -f "$OVERLAY_PATH/overlay.json" ]; then
-        if command -v python3 >/dev/null 2>&1; then
-            while IFS= read -r port_mapping; do
-                if [ -n "$port_mapping" ]; then
-                    PORT_ARGS+=(-p "$port_mapping")
-                    PORT_MAPPINGS+=("$port_mapping")
-                fi
-            done < <(OVERLAY_JSON="$OVERLAY_PATH/overlay.json" python3 - <<'PY'
-import json, os, sys
-path = os.environ["OVERLAY_JSON"]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception as exc:
-    print(f"Warning: could not parse {path}: {exc}", file=sys.stderr)
-    sys.exit(0)
-ports = data.get("ports", []) if isinstance(data, dict) else []
-if isinstance(ports, str):
-    ports = [ports]
-for port in ports:
-    if isinstance(port, str) and port.strip():
-        print(port.strip())
-PY
-)
-            # Runtime docker flags. Unlike "ports", these are ALLOWLISTED and
-            # validated rather than forwarded verbatim: overlay.json is
-            # committed with the repo and applied silently at the next launch,
-            # so a cloned — or agent-written — branch must not be able to reach
-            # the host with -v /:/host, --privileged or --pid=host. Each key
-            # maps to exactly one docker flag:
-            #
-            #   "capabilities": ["NET_ADMIN"]               --cap-add NET_ADMIN
-            #   "devices":      ["/dev/net/tun"]            --device /dev/net/tun
-            #   "sysctls":      {"net.ipv4.ip_forward": 1}  --sysctl net.ipv4.ip_forward=1
-            #   "env":          ["TS_AUTHKEY"]              -e TS_AUTHKEY
-            #
-            # An "env" entry with no "=" forwards the variable BY NAME, so its
-            # value comes from the launching environment and never appears in
-            # the container's argv (keeps secrets out of `ps`). The "NAME=value"
-            # form is accepted too, for non-secret values.
-            #
-            # Like ports, these are runtime-only: overlay.json is excluded from
-            # the image hash, so changing them never triggers a rebuild.
-            while IFS= read -r runtime_arg; do
-                if [ -n "$runtime_arg" ]; then
-                    OVERLAY_RUNTIME_ARGS+=("$runtime_arg")
-                fi
-            done < <(overlay_runtime_args "$OVERLAY_PATH/overlay.json")
-        else
-            echo -e "${YELLOW}Warning: python3 not found; ignoring ports and runtime flags in overlay.json.${NC}"
-        fi
-    fi
-
     if [ -f "$OVERLAY_PATH/Dockerfile" ]; then
         OVERLAY_BUILD="$(cat "$OVERLAY_PATH/Dockerfile")"$'\n'
         OVERLAY_CONTEXT="$OVERLAY_PATH"
@@ -1871,6 +2640,50 @@ elif [ -f "$OVERLAY_PATH" ]; then
     done < "$OVERLAY_PATH"
 fi
 
+# Runtime docker flags and ports: fold the project overlay.json together with
+# each active skill manifest's "runtime" block (design §5.2). Runs even without a
+# project overlay dir, so a skill adopted user-wide (e.g. tailnet) contributes
+# its capabilities/device/env by itself. Unlike the image fragments, these are
+# ALLOWLISTED and validated rather than forwarded verbatim: overlay.json is
+# committed with the repo and applied silently at the next launch, so a cloned —
+# or agent-written — branch must not reach the host with -v /:/host, --privileged
+# or --pid=host. Each key maps to exactly one docker flag:
+#
+#   "capabilities": ["NET_ADMIN"]               --cap-add NET_ADMIN
+#   "devices":      ["/dev/net/tun"]            --device /dev/net/tun
+#   "sysctls":      {"net.ipv4.ip_forward": 1}  --sysctl net.ipv4.ip_forward=1
+#   "env":          ["TS_AUTHKEY"]              -e TS_AUTHKEY
+#
+# An "env" entry with no "=" forwards the variable BY NAME, so its value comes
+# from the launching environment and never appears in the container's argv (keeps
+# secrets out of `ps`). The "NAME=value" form is accepted too, for non-secret
+# values. All of these are runtime-only: overlay.json and skill manifests are
+# excluded from the image hash, so changing them never triggers a rebuild.
+if command -v python3 >/dev/null 2>&1; then
+    CC_RT_SOURCES="$(build_runtime_sources)"
+    if [ -n "$CC_RT_SOURCES" ] && [ "$CC_RT_SOURCES" != "[]" ]; then
+        # Capture instead of piping so array appends land in this shell, and so a
+        # conflict (merger exits non-zero, having named both claimants on stderr)
+        # fails the launch loudly rather than silently dropping a claim.
+        if ! CC_RT_OUT="$(CC_SOURCES="$CC_RT_SOURCES" overlay_runtime_merge)"; then
+            echo -e "${RED}Error: conflicting runtime declarations across the project overlay and its skills.${NC}"
+            echo -e "${RED}Resolve the conflict above, or reject the offending skill, then relaunch.${NC}"
+            exit 1
+        fi
+        while IFS=$'\t' read -r rt_tag rt_val; do
+            [ -n "$rt_tag" ] || continue
+            case "$rt_tag" in
+                RTARG) OVERLAY_RUNTIME_ARGS+=("$rt_val") ;;
+                PORT)  PORT_ARGS+=(-p "$rt_val"); PORT_MAPPINGS+=("$rt_val") ;;
+            esac
+        done <<EOF_RT
+$CC_RT_OUT
+EOF_RT
+    fi
+elif [ -f "$OVERLAY_PATH/overlay.json" ]; then
+    echo -e "${YELLOW}Warning: python3 not found; ignoring ports and runtime flags in overlay.json.${NC}"
+fi
+
 # Skill-provided fragments go FIRST, so the workspace's own overlay can build on
 # what they install. A project with no overlay directory still gets an image
 # when a skill contributes one (OVERLAY_CONTEXT stays empty and the build runs
@@ -1897,6 +2710,15 @@ if [ ${#OVERLAY_RUNTIME_ARGS[@]} -gt 0 ]; then
         prev_runtime_arg="$runtime_arg"
     done
     echo -e "${GREEN}Overlay runtime flags:${NC} ${YELLOW}${RUNTIME_SUMMARY}${NC}"
+fi
+
+# BOOT phase: assemble the ordered startup drop-in list (project startup.sh +
+# each active skill's container.startup) and point the entrypoint at it. The
+# entrypoint runs each in order, non-fatally, as the mapped user. Recomputed
+# every launch so a removed/rejected skill's drop-in falls out.
+collect_startup_dropins
+if [ -n "$STARTUP_DROPINS_FILE" ]; then
+    EXTRA_DOCKER_ARGS+=(-e "CLAUDE_STARTUP_DROPINS=/claude/startup-dropins")
 fi
 
 # Named services declared in overlay.json (display only — resolution happens
@@ -2099,6 +2921,10 @@ if [ "$USE_PROXY" = true ]; then
     # Run the container with proxy. The svc-mux publish uses an EPHEMERAL host
     # port (empty host part) so concurrent containers never collide; the
     # background registration discovers the assigned port via `docker port`.
+    # Start any launcher-supervised host services (mount/tcp bridges) before the
+    # container, so a mount watcher is waiting on the mailbox and a tcp service's
+    # discovery env var is injected below. Torn down by cleanup on exit.
+    start_host_services
     register_services_async
     docker run --rm -it \
         --name "$CC_CONTAINER_NAME" \
@@ -2139,6 +2965,10 @@ else
     # Run the container. The svc-mux publish uses an EPHEMERAL host port (empty
     # host part) so concurrent containers never collide; the background
     # registration discovers the assigned port via `docker port`.
+    # Start any launcher-supervised host services (mount/tcp bridges) before the
+    # container, so a mount watcher is waiting on the mailbox and a tcp service's
+    # discovery env var is injected below. Torn down by cleanup on exit.
+    start_host_services
     register_services_async
     docker run --rm -it \
         --name "$CC_CONTAINER_NAME" \

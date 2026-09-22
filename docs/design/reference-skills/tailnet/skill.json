@@ -1,0 +1,25 @@
+{
+  "name": "tailnet",
+  "version": "1",
+
+  "image": {
+    "dockerfile": "Dockerfile.snippet"
+  },
+
+  "runtime": {
+    "capabilities": ["NET_ADMIN"],
+    "devices": ["/dev/net/tun"],
+    "env": ["TS_AUTHKEY"]
+  },
+
+  "container": {
+    "startup": "tailnet-up.sh",
+    "order": 50
+  },
+
+  "requires": {
+    "launcher": ">=1.7.0",
+    "hostDevices": ["/dev/net/tun"],
+    "env": ["TS_AUTHKEY"]
+  }
+}

@@ -10,37 +10,62 @@ set -e
 USER_UID=${USER_UID:-1000}
 USER_GID=${USER_GID:-1000}
 
-# Overlay startup hook: <workspace>/.claude-container-overlay/startup.sh runs
-# once per container start, just before the command. It exists for per-project
-# runtime setup that can't be baked into an image layer because it needs the
-# live container — bringing up a daemon, joining a network, seeding a socket.
-# (Persistent tooling still belongs in the overlay Dockerfile.)
+# Overlay startup hooks run once per container start, just before the command.
+# They exist for per-project (and per-skill) runtime setup that can't be baked
+# into an image layer because it needs the live container — bringing up a daemon,
+# joining a network, seeding a socket. (Persistent tooling still belongs in an
+# image layer.)
 #
-# Run to COMPLETION rather than backgrounded, so an unattended agent starts with
-# the setup already done — but under a timeout, since a hook that blocks forever
-# would otherwise wedge every launch of that workspace. A failing or timed-out
-# hook warns and continues; the session is still usable, just without whatever
-# the hook provides.
-# CLAUDE_OVERLAY_STARTUP overrides the path, mainly so the hook is testable
-# outside a container.
+# The set of hooks is an ORDERED run of drop-ins: the project's startup.sh plus
+# each active skill's container.startup drop-in, sorted by the launcher and
+# listed one container-path-per-line in the file named by CLAUDE_STARTUP_DROPINS
+# (a file under the mounted /claude config dir). When that file is absent (e.g.
+# the entrypoint invoked directly in a test) a single CLAUDE_OVERLAY_STARTUP hook
+# is run instead — the legacy behaviour.
+#
+# The drop-in contract (see docs/design §5.3): each hook is idempotent (a
+# container may restart), non-fatal by default (returns 0 on a missing
+# prerequisite so the session still opens), and handles its own teardown where
+# relevant. Each runs to COMPLETION rather than backgrounded, so an unattended
+# agent starts with the setup already done — but under a timeout, since a hook
+# that blocks forever would otherwise wedge every launch. A failing or timed-out
+# hook warns and continues; the next hook and the session still run.
 OVERLAY_STARTUP=${CLAUDE_OVERLAY_STARTUP:-/workspace/.claude-container-overlay/startup.sh}
+STARTUP_DROPINS=${CLAUDE_STARTUP_DROPINS:-}
 STARTUP_TIMEOUT=${CLAUDE_STARTUP_TIMEOUT:-120}
 
 run_overlay_startup() {
-    [ -f "$OVERLAY_STARTUP" ] || return 0
-    local runner=() status=0
+    local -a runner=()
     if [ "$#" -gt 0 ]; then
         runner=(gosu "$1")
     fi
-    echo "Running overlay startup hook: $OVERLAY_STARTUP"
-    # Invoked via bash rather than executed directly: the exec bit is easy to
-    # lose across a checkout, and failing silently on that would be baffling.
-    "${runner[@]}" timeout "$STARTUP_TIMEOUT" bash "$OVERLAY_STARTUP" || status=$?
-    if [ "$status" -eq 124 ]; then
-        echo "Warning: overlay startup hook timed out after ${STARTUP_TIMEOUT}s (set CLAUDE_STARTUP_TIMEOUT to change)." >&2
-    elif [ "$status" -ne 0 ]; then
-        echo "Warning: overlay startup hook exited $status; continuing without it." >&2
+    local -a scripts=()
+    local line
+    if [ -n "$STARTUP_DROPINS" ] && [ -f "$STARTUP_DROPINS" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            [ -n "$line" ] && scripts+=("$line")
+        done < "$STARTUP_DROPINS"
+    elif [ -f "$OVERLAY_STARTUP" ]; then
+        scripts=("$OVERLAY_STARTUP")
     fi
+    [ ${#scripts[@]} -gt 0 ] || return 0
+    local script status
+    for script in "${scripts[@]}"; do
+        if [ ! -f "$script" ]; then
+            echo "Warning: overlay startup drop-in not found, skipping: $script" >&2
+            continue
+        fi
+        echo "Running overlay startup hook: $script"
+        status=0
+        # Invoked via bash rather than executed directly: the exec bit is easy to
+        # lose across a checkout, and failing silently on that would be baffling.
+        "${runner[@]}" timeout "$STARTUP_TIMEOUT" bash "$script" || status=$?
+        if [ "$status" -eq 124 ]; then
+            echo "Warning: startup hook '$script' timed out after ${STARTUP_TIMEOUT}s (set CLAUDE_STARTUP_TIMEOUT to change)." >&2
+        elif [ "$status" -ne 0 ]; then
+            echo "Warning: startup hook '$script' exited $status; continuing without it." >&2
+        fi
+    done
     return 0
 }
 
