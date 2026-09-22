@@ -665,7 +665,13 @@ runtime = manifest.get("runtime") or {}
 host_services = manifest.get("hostServices") or {}
 container = manifest.get("container") or {}
 
-privileged = bool(frag_text) or bool(runtime) or bool(host_services)
+# The privilege-CONSENT gate applies only to skills whose MANIFEST declares an
+# image/runtime/hostServices contribution. A manifest-less bare overlay.Dockerfile
+# is NOT gated here: its only privileged surface (a root RUN) is already gated by
+# the pre-existing image-rebuild confirmation prompt, and double-gating it would
+# consume the tty input that prompt expects. The fragment TEXT still feeds the
+# digest/summary below, so a manifest skill's fragment change re-opens consent.
+privileged = bool(image) or bool(runtime) or bool(host_services)
 if mode == "check":
     sys.exit(0 if privileged else 1)
 
@@ -926,6 +932,11 @@ prompt_undecided_skills() {
             while IFS= read -r pln; do
                 [ -n "$pln" ] && echo -e "${YELLOW}    - $pln${NC}"
             done < <(skill_privilege_info "$USER_SKILLS_DIR/$name" summary)
+        elif skill_has_fragment "$USER_SKILLS_DIR/$name"; then
+            # Manifest-less bare fragment: keep the legacy image-fragment warning
+            # (the rebuild-confirmation prompt is its consent surface, not the gate).
+            echo -e "${YELLOW}  This skill ships an image-build fragment: accepting it rebuilds this${NC}"
+            echo -e "${YELLOW}  project's container image and runs that fragment as root at build time.${NC}"
         fi
         while true; do
             printf 'Include it in this project? [y]es / [n]o / [s]kip for now: '
