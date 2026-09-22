@@ -50,7 +50,12 @@ import sys
 import threading
 import time
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent  # repo root (tools/..)
+# Repo root whose .hostdeploy mailbox the container shares. When the claude-
+# container launcher supervises this watcher as a host service it sets
+# CC_HOST_SERVICE_ROOT to the mounted repo root (and runs us with that cwd); the
+# manual path (script copied into <repo>/tools/) falls back to tools/.. .
+_root_env = os.environ.get("CC_HOST_SERVICE_ROOT")
+ROOT = pathlib.Path(_root_env).resolve() if _root_env else pathlib.Path(__file__).resolve().parent.parent
 BOX = ROOT / ".hostdeploy"
 ALLOWED = {"bazel", "bazelisk", "nix", "git"}  # argv[0] allowlist
 # Wall-clock backstop for a single command. Deploys are minutes; this only fires on

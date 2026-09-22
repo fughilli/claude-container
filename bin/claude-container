@@ -111,6 +111,17 @@ SKILLS_IGNORE_NEW=false
 # mid-session need no restart.
 SERVICES_DIR="$CONFIG_BASE_DIR/services"
 MUX_CONTAINER_PORT=7999
+# Host services: launcher-supervised HOST processes the container reaches by name
+# — the mirror of the in-container `services` above. Declared by a skill manifest
+# ("hostServices") or a project overlay.json ("hostServices"). The launcher starts
+# them before the container, health-checks, restarts per policy, and stops them on
+# exit. HOST_EXEC_ALLOW is the user-editable allowlist of program names a host
+# service may launch (the single host-exec control, design §6). See
+# start_host_services / stop_host_services.
+HOST_EXEC_ALLOW_FILE="$CONFIG_BASE_DIR/host-exec-allow"
+HOST_SVC_RUN_DIR=""
+HOST_SVC_STOPFLAG=""
+HOST_SVC_SUPERVISORS=()
 ROUTER_ACTION=""
 SERVICE_PORT_SPEC=""
 SERVICE_INSTANCE=""
@@ -1522,6 +1533,296 @@ deregister_services() {
     return 0
 }
 
+# --- Host services (design §5.4, §6) ------------------------------------------
+#
+# A host service is a HOST process the container reaches by name — the mirror of
+# the in-container `services`. The launcher starts it before the container,
+# health-checks it, restarts per policy, and stops it on exit, so a bridge like
+# host-deploy's watcher no longer has to be started by hand. Two transports:
+#   * mount — communication is over the shared repo mount (no port); the launcher
+#     just supervises the process and watches a heartbeat file.
+#   * tcp   — the process listens on a host port; the launcher allocates/validates
+#     it, injects a discovery env var (`expose`) = host.docker.internal:<port>,
+#     and maps host.docker.internal so the container can reach it.
+# The host-exec allowlist (HOST_EXEC_ALLOW_FILE) is the single control that stops
+# an adopted skill from launching host processes the user did not permit.
+
+host_exec_seed_policy() {
+    [ -f "$HOST_EXEC_ALLOW_FILE" ] && return 0
+    mkdir -p "$(dirname "$HOST_EXEC_ALLOW_FILE")"
+    cat > "$HOST_EXEC_ALLOW_FILE" <<'EOF'
+# claude-container host-exec allowlist. One program name per line: a host service
+# (declared by a skill manifest's "hostServices" or a project overlay.json) may
+# only launch a program whose name (argv[0] basename) appears here. This is the
+# host-exec control — remove entries to tighten, add to permit. The exact start
+# command of every host service is also shown in the skill's consent diff.
+python3
+python
+bazel
+bazelisk
+nix
+git
+EOF
+}
+
+host_exec_allowed() {
+    host_exec_seed_policy
+    grep -qxF "$1" "$HOST_EXEC_ALLOW_FILE" 2>/dev/null
+}
+
+# Emit CC_HS_SOURCES for collect_host_services: project overlay.json + each
+# active skill manifest, each tagged with the dir the service's script resolves
+# against (the skill dir, or the repo for a project-declared service).
+build_host_service_sources() {
+    {
+        if [ -f "$OVERLAY_PATH/overlay.json" ]; then
+            printf 'overlay\tproject overlay.json\t%s\t%s\n' "$OVERLAY_PATH/overlay.json" "$WORKSPACE_DIR"
+        fi
+        while IFS=$'\t' read -r hs_name hs_dir; do
+            [ -n "$hs_name" ] || continue
+            [ -f "$hs_dir/$SKILL_MANIFEST_FILE" ] && \
+                printf "manifest\tskill '%s'\t%s\t%s\n" "$hs_name" "$hs_dir/$SKILL_MANIFEST_FILE" "$hs_dir"
+        done < <(active_skills)
+    } | python3 -c 'import sys, json; print(json.dumps([
+        {"kind": k, "label": l, "path": p, "dir": d}
+        for k, l, p, d in (ln.rstrip("\n").split("\t") for ln in sys.stdin if ln.strip())
+    ]))'
+}
+
+# Resolve host service declarations across all sources into tab records:
+#   name  transport  restart  cwd  healthcheck  port  expose  requires_csv  dir  argv_json
+# with $REPO_ROOT/$PORT substituted, tcp ports allocated, and script-filename
+# argv tokens rewritten to absolute paths in the skill dir. A service name
+# claimed by two sources is a fatal error (exit 3), naming both.
+collect_host_services() {
+    python3 - <<'PY'
+import json, os, shlex, socket, sys
+
+sources = json.loads(os.environ.get("CC_HS_SOURCES", "[]"))
+repo = os.environ.get("CC_REPO_ROOT", "")
+
+
+def fatal(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(3)
+
+
+def warn(msg):
+    print(f"Warning: {msg}", file=sys.stderr)
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+seen = {}
+recs = []
+for src in sources:
+    label, kind, d = src.get("label"), src.get("kind"), src.get("dir") or ""
+    try:
+        data = json.load(open(src["path"]))
+    except FileNotFoundError:
+        continue
+    except Exception as exc:
+        warn(f"{label}: could not parse: {exc}")
+        continue
+    if not isinstance(data, dict):
+        continue
+    hs = data.get("hostServices") or {}
+    if not isinstance(hs, dict):
+        warn(f'{label}: "hostServices" must be an object; ignoring it.')
+        continue
+    for name, spec in hs.items():
+        if name in seen:
+            fatal(f'host service "{name}" declared by two sources: {seen[name]} and {label}.')
+        seen[name] = label
+        if not isinstance(spec, dict):
+            warn(f'{label}: host service "{name}" must be an object; ignoring it.')
+            continue
+        start = spec.get("start")
+        if not isinstance(start, str) or not start.strip():
+            warn(f'{label}: host service "{name}" has no "start"; ignoring it.')
+            continue
+        transport = spec.get("transport", "mount")
+        if transport not in ("mount", "tcp"):
+            warn(f'{label}: host service "{name}" has bad transport {transport!r}; using mount.')
+            transport = "mount"
+        restart = spec.get("restart", "on-failure")
+        if restart not in ("never", "on-failure", "always"):
+            restart = "on-failure"
+        cwd = (spec.get("cwd") or "$REPO_ROOT").replace("${REPO_ROOT}", repo).replace("$REPO_ROOT", repo)
+        if not cwd:
+            cwd = repo
+        port = ""
+        if transport == "tcp":
+            p = spec.get("port", "auto")
+            port = str(free_port()) if p in (None, "auto", "") else str(p)
+        argv = []
+        for i, tok in enumerate(shlex.split(start)):
+            if port:
+                tok = tok.replace("${PORT}", port).replace("$PORT", port)
+            if i > 0 and d and os.path.exists(os.path.join(d, tok)):
+                tok = os.path.abspath(os.path.join(d, tok))
+            argv.append(tok)
+        hc = (spec.get("healthcheck") or "")
+        if port:
+            hc = hc.replace("${PORT}", port).replace("$PORT", port)
+        expose = spec.get("expose") or ""
+        req = spec.get("requires") or []
+        if isinstance(req, str):
+            req = [req]
+        recs.append([name, transport, restart, cwd, hc, port, expose,
+                     ",".join(map(str, req)), d, json.dumps(argv)])
+
+# Records are joined with US (\x1f), NOT tab: tab is IFS whitespace, so bash read
+# would collapse the empty middle fields (no healthcheck/port/expose) and shift
+# the columns. A non-whitespace separator keeps empty fields intact.
+for r in recs:
+    print("\x1f".join(r))
+PY
+}
+
+# Per-service background supervisor: (re)start the process per its restart policy
+# until the stop flag appears, then reap it. The child runs in its own process
+# group so a kill reaps its whole tree; CC_HOST_SERVICE_ROOT tells a repo-rooted
+# watcher (e.g. hostdeploy.py) where the shared mailbox lives.
+_host_service_supervisor() {
+    local sd="$1" stopflag="$2"
+    local cwd restart root child rc
+    cwd="$(cat "$sd/cwd")"; restart="$(cat "$sd/restart")"; root="$(cat "$sd/root")"
+    local -a argv=()
+    while IFS= read -r a; do argv+=("$a"); done < "$sd/argv"
+    [ ${#argv[@]} -gt 0 ] || return 0
+    while [ ! -f "$stopflag" ]; do
+        ( cd "$cwd" 2>/dev/null && exec env CC_HOST_SERVICE_ROOT="$root" "${argv[@]}" ) >>"$sd/log" 2>&1 &
+        child=$!
+        echo "$child" > "$sd/pid"
+        while kill -0 "$child" 2>/dev/null; do
+            if [ -f "$stopflag" ]; then
+                kill -TERM "$child" 2>/dev/null
+                break
+            fi
+            sleep 0.5
+        done
+        wait "$child" 2>/dev/null; rc=$?
+        [ -f "$stopflag" ] && break
+        case "$restart" in
+            never) break ;;
+            on-failure) [ "$rc" -eq 0 ] && break ;;
+            always) : ;;
+        esac
+        sleep 1
+    done
+    return 0
+}
+
+# Best-effort readiness probe (non-fatal): a mount service is healthy once its
+# heartbeat file appears; a tcp service once its healthcheck URL answers.
+host_service_healthcheck() {
+    local name="$1" transport="$2" cwd="$3" hc="$4" i f
+    [ -n "$hc" ] || return 0
+    if [ "$transport" = "mount" ]; then
+        case "$hc" in /*) f="$hc" ;; *) f="$cwd/$hc" ;; esac
+        for i in $(seq 1 16); do
+            [ -e "$f" ] && { echo -e "${GREEN}  '$name' is up${NC} (heartbeat $f)"; return 0; }
+            sleep 0.5
+        done
+        echo -e "${YELLOW}  '$name' has not reported healthy within 8s (supervision continues; see its log).${NC}"
+    else
+        command -v curl >/dev/null 2>&1 || return 0
+        for i in $(seq 1 16); do
+            curl -fsS -o /dev/null "$hc" 2>/dev/null && { echo -e "${GREEN}  '$name' is up${NC} ($hc)"; return 0; }
+            sleep 0.5
+        done
+        echo -e "${YELLOW}  '$name' health check did not pass within 8s ($hc).${NC}"
+    fi
+    return 0
+}
+
+# Start and supervise every declared host service. Skips one whose program is not
+# in the host-exec allowlist or whose host `requires` are missing (both warn).
+# For tcp services, injects the discovery env var and maps host.docker.internal.
+start_host_services() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    local sources out
+    sources="$(build_host_service_sources)"
+    [ -n "$sources" ] && [ "$sources" != "[]" ] || return 0
+    if ! out="$(CC_HS_SOURCES="$sources" CC_REPO_ROOT="$WORKSPACE_DIR" collect_host_services)"; then
+        echo -e "${RED}Error: conflicting host service declarations across the project overlay and its skills.${NC}"
+        exit 1
+    fi
+    [ -n "$out" ] || return 0
+    HOST_SVC_RUN_DIR="$CONFIG_BASE_DIR/host-services/$$"
+    HOST_SVC_STOPFLAG="$HOST_SVC_RUN_DIR/.stop"
+    mkdir -p "$HOST_SVC_RUN_DIR"
+    local name transport restart cwd healthcheck port expose requires dir argv_json
+    while IFS=$'\x1f' read -r name transport restart cwd healthcheck port expose requires dir argv_json; do
+        [ -n "$name" ] || continue
+        local -a argv=()
+        while IFS= read -r tok; do argv+=("$tok"); done \
+            < <(printf '%s' "$argv_json" | python3 -c 'import sys, json; [print(t) for t in json.load(sys.stdin)]')
+        [ ${#argv[@]} -gt 0 ] || continue
+        local prog; prog="$(basename "${argv[0]}")"
+        if ! host_exec_allowed "$prog"; then
+            echo -e "${YELLOW}Host service '$name' NOT started: '$prog' is not in the host-exec allowlist${NC}"
+            echo -e "${YELLOW}  (${HOST_EXEC_ALLOW_FILE}). Add it there to permit this host command.${NC}"
+            continue
+        fi
+        local missing="" t
+        for t in ${requires//,/ }; do
+            [ -n "$t" ] && ! command -v "$t" >/dev/null 2>&1 && missing="$missing $t"
+        done
+        if [ -n "$missing" ]; then
+            echo -e "${YELLOW}Host service '$name' NOT started: missing host tool(s):$missing.${NC}"
+            continue
+        fi
+        if [ "$transport" = "tcp" ] && [ -n "$port" ]; then
+            [ -n "$expose" ] && EXTRA_DOCKER_ARGS+=(-e "$expose=host.docker.internal:$port")
+            case " ${EXTRA_DOCKER_ARGS[*]-} " in
+                *" host.docker.internal:host-gateway "*) : ;;
+                *) EXTRA_DOCKER_ARGS+=(--add-host "host.docker.internal:host-gateway") ;;
+            esac
+        fi
+        local sd="$HOST_SVC_RUN_DIR/$name"; mkdir -p "$sd"
+        printf '%s\n' "${argv[@]}" > "$sd/argv"
+        printf '%s' "$cwd" > "$sd/cwd"
+        printf '%s' "$restart" > "$sd/restart"
+        printf '%s' "$WORKSPACE_DIR" > "$sd/root"
+        : > "$sd/log"
+        _host_service_supervisor "$sd" "$HOST_SVC_STOPFLAG" &
+        HOST_SVC_SUPERVISORS+=($!)
+        if [ "$transport" = "tcp" ] && [ -n "$expose" ]; then
+            echo -e "${GREEN}Host service:${NC} ${YELLOW}${name}${NC} (tcp, ${expose}=host.docker.internal:${port})"
+        else
+            echo -e "${GREEN}Host service:${NC} ${YELLOW}${name}${NC} (${transport})"
+        fi
+        host_service_healthcheck "$name" "$transport" "$cwd" "$healthcheck"
+    done <<EOF_HS
+$out
+EOF_HS
+    return 0
+}
+
+stop_host_services() {
+    [ -n "$HOST_SVC_STOPFLAG" ] || return 0
+    : > "$HOST_SVC_STOPFLAG" 2>/dev/null || true
+    local pid sd
+    for pid in ${HOST_SVC_SUPERVISORS[@]+"${HOST_SVC_SUPERVISORS[@]}"}; do
+        kill "$pid" 2>/dev/null || true
+    done
+    if [ -n "$HOST_SVC_RUN_DIR" ] && [ -d "$HOST_SVC_RUN_DIR" ]; then
+        for sd in "$HOST_SVC_RUN_DIR"/*/; do
+            [ -f "$sd/pid" ] && kill "$(cat "$sd/pid")" 2>/dev/null || true
+        done
+        rm -rf "$HOST_SVC_RUN_DIR"
+    fi
+    return 0
+}
+
 # Function to stop datasette
 stop_datasette() {
     if docker ps -a --format '{{.Names}}' | grep -q "^${DATASETTE_CONTAINER_NAME}$"; then
@@ -1644,6 +1945,7 @@ start_datasette() {
 cleanup() {
     local exit_code=$?
     deregister_services
+    stop_host_services
     if [ $exit_code -ne 0 ] && [ "$USE_PROXY" = true ]; then
         echo -e "\n${YELLOW}Error occurred. Cleaning up...${NC}"
         stop_proxy
@@ -2619,6 +2921,10 @@ if [ "$USE_PROXY" = true ]; then
     # Run the container with proxy. The svc-mux publish uses an EPHEMERAL host
     # port (empty host part) so concurrent containers never collide; the
     # background registration discovers the assigned port via `docker port`.
+    # Start any launcher-supervised host services (mount/tcp bridges) before the
+    # container, so a mount watcher is waiting on the mailbox and a tcp service's
+    # discovery env var is injected below. Torn down by cleanup on exit.
+    start_host_services
     register_services_async
     docker run --rm -it \
         --name "$CC_CONTAINER_NAME" \
@@ -2659,6 +2965,10 @@ else
     # Run the container. The svc-mux publish uses an EPHEMERAL host port (empty
     # host part) so concurrent containers never collide; the background
     # registration discovers the assigned port via `docker port`.
+    # Start any launcher-supervised host services (mount/tcp bridges) before the
+    # container, so a mount watcher is waiting on the mailbox and a tcp service's
+    # discovery env var is injected below. Torn down by cleanup on exit.
+    start_host_services
     register_services_async
     docker run --rm -it \
         --name "$CC_CONTAINER_NAME" \

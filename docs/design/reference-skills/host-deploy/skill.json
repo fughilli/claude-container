@@ -1,0 +1,19 @@
+{
+  "name": "host-deploy",
+  "version": "1",
+
+  "hostServices": {
+    "hostdeploy": {
+      "start": "python3 hostdeploy.py",
+      "cwd": "$REPO_ROOT",
+      "transport": "mount",
+      "healthcheck": ".hostdeploy/alive",
+      "requires": ["python3"],
+      "restart": "on-failure"
+    }
+  },
+
+  "requires": {
+    "launcher": ">=1.7.0"
+  }
+}
